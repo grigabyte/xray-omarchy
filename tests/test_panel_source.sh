@@ -95,6 +95,19 @@ grep -Fq 'if (args.length !== 2 || !Model.validNodeId(args[1])) return false' Se
 # A rule host is one the CLI reported and a host by the CLI's own rules.
 grep -Fq 'if (ruleProcess.running || Model.ruleHost(host) !== host || !Model.knownHost(root.status, host)) return false' Service.qml
 grep -Fq 'var HOST_RE = /^(?=.{3,253}$)' Model.js
+# Checked sites: the check is its own process, never in the poll; a new site's
+# values checked by Model and after "--"; removal only of a name the CLI reported.
+grep -Fq 'command: [root.cli, "site", "check", "--json"]' Service.qml
+refute -F '"site"' <<<"$(sed -n '/id: statusProcess/,/^  }/p' Service.qml)"
+grep -Fq 'siteProcess.command = [root.cli, "site", "add", "--json", "--", name, url]' Service.qml
+grep -Fq 'var url = Model.siteUrl(urlText)' Service.qml
+grep -Fq 'siteProcess.command = [root.cli, "site", "rm", "--json", "--", name]' Service.qml
+grep -Fq '!Model.validSiteName(name, root.status.sites)) return false' Service.qml
+grep -Fq 'siteNotifyProcess.command = [root.cli, "site", "notify", on ? "on" : "off", "--json"]' Service.qml
+# A field of the site form keeps the panel's letter keys off.
+grep -Fq '|| addSiteForm.typing' components/PanelContent.qml
+# The check runs on its own only while the panel is open and the last one is stale.
+grep -Fq 'if (root.panelOpen && root.wantedRunning === -1 && Model.sitesStale(next, 90)' Service.qml
 # `core status` only while the core page is shown or an update runs.
 grep -Fq 'value: root.page === "core" && root.panelOpen' components/PanelContent.qml
 refute -n 'pollCore' Panel.qml components/*.qml
@@ -178,11 +191,11 @@ grep -Fq 'useConfirm.selectedIndex = 0' components/PanelContent.qml
 refute -n 'updateCore\|confirmFallbackApply' Panel.qml components/CorePage.qml components/SettingsPage.qml components/MoreMenu.qml components/SitesPage.qml
 ipc="$(sed -n '/IpcHandler {/,/^  }/p' Panel.qml)"
 grep -Fq 'function select(value: string)' <<<"$ipc"
-refute -E 'setTunnel|useSubscription|updateSubscriptions|runFallback|setNotify|addRule|removeRule|updateCore|confirmFallbackApply' <<<"$ipc"
+refute -E 'setTunnel|useSubscription|updateSubscriptions|runFallback|setNotify|addRule|removeRule|updateCore|confirmFallbackApply|addSite|removeSite|setSiteNotify|checkSites' <<<"$ipc"
 # No single-letter key reaches on/off or use.
 keys="$(sed -n '/onTextKey:/,/^  }/p' components/PanelContent.qml)"
 grep -Fq 'service.refresh()' <<<"$keys"
-refute -E 'setTunnel|useSubscription|askUse|askConfirm|runFallback|setNotify|addRule|removeRule|updateCore' <<<"$keys"
+refute -E 'setTunnel|useSubscription|askUse|askConfirm|runFallback|setNotify|addRule|removeRule|updateCore|addSite|removeSite|setSiteNotify' <<<"$keys"
 # The bar icon has one mouse action: open the panel.
 grep -Fq 'if (buttonCode === Qt.LeftButton) root.toggle()' Panel.qml
 
@@ -286,6 +299,10 @@ cli = {
     "core.": ["ok", "up_to_date", "download_failed", "checksum_mismatch", "config_rejected", "check_failed",
               "rolled_back", "stage_failed", "stage_busy", "no_space", "not_pinned", "lost", "timeout", "other"],
     "subadd.": ["invalid_url", "insecure_url", "invalid_name", "usage", "other"],
+    "siteadd.": ["invalid_url", "insecure_url", "invalid_name", "too_many", "usage", "other"],
+    "siterm.": ["not_found", "other"],
+    "sites.err.": ["timeout", "dns_failed", "refused", "reset", "tls_cert", "tls_failed", "unreachable",
+                   "bad_answer", "http_status", "other"],
     "corePage.last.": ["ok", "rolled_back", "stage_failed", "stage_busy", "no_space", "lost", "other"],
     "guard.code.": ["core_stopped", "no_tun", "not_routed", "killswitch_off", "killswitch_unknown", "killswitch_tampered", "dns_bypass", "unknown", "other"],
     "subs.skip.": ["insecure_tls", "hy2_obfs", "parse_error", "unsupported_scheme", "loopback_profile", "no_group", "no_node", "clash_format"],

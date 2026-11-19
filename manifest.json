@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "grigabyte.xray-omarchy",
   "name": "Xray",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "author": "grigabyte",
   "license": "MIT",
-  "description": "VPN client in the bar on the Xray core: subscriptions with VLESS (REALITY, XHTTP), Trojan, Shadowsocks, VMess and Hysteria2 links or xray JSON profiles, a system-wide TUN, an nftables killswitch, split DNS, per-site rules, an optional fallback node, desktop notifications and xray core updates with pinned checksums. Installs its xray-omarchy backend package on first use (asks first).",
+  "description": "VPN client in the bar on the Xray core: subscriptions with VLESS (REALITY, XHTTP), Trojan, Shadowsocks, VMess and Hysteria2 links or xray JSON profiles, a system-wide TUN, an nftables killswitch, split DNS, per-site rules, site checks (does a site open and which way it goes), an optional fallback node, desktop notifications and xray core updates with pinned checksums. Installs its xray-omarchy backend package on first use (asks first).",
   "kinds": [
     "bar-widget"
   ],

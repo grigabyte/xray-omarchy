@@ -8,7 +8,7 @@ const M = load("Model.js")
 // ---- a real `xray-omarchy status --json --nodes` answer, shape for shape -----------
 const sample = {
   running: true, service: "active", tun: true, killswitch: "on", dns: "xray",
-  mode: "auto", selected: null, current: "🇫🇮 Helsinki 1", current_id: "7951707fd4",
+  mode: "auto", selected: null, current: "🇫🇮 Helsinki 1", current_id: "abcdefabcd",
   exit: { ip: "203.0.113.23", country: "FI", ts: 1794982055 },
   traffic: {
     today: { tunnel_up: 11290457, tunnel_down: 1290954, direct_up: 25508, direct_down: 144660 },
@@ -29,8 +29,8 @@ const sample = {
   errors: ["2026/11/18 11:06:23.652362 [Warning] core: Xray 26.10.31 started"],
   time: 1794982100,
   nodes: [
-    { id: "7951707fd4", name: "🇫🇮 Helsinki 1", kind: "node", members: 1, delay: 227, alive: true, traffic: 1 },
-    { id: "64681dfc38", name: "🇩🇪 Frankfurt 1", kind: "node", members: 1, delay: 913, alive: true, traffic: 2 },
+    { id: "abcdefabcd", name: "🇫🇮 Helsinki 1", kind: "node", members: 1, delay: 227, alive: true, traffic: 1 },
+    { id: "0123456789", name: "🇩🇪 Frankfurt 1", kind: "node", members: 1, delay: 913, alive: true, traffic: 2 },
     { id: "aaaaaaaaaa", name: "Dead", kind: "node", members: 1, delay: null, alive: false, traffic: 0 },
     { id: "bbbbbbbbbb", name: "Fresh", kind: "group", members: 3, delay: null, alive: null, traffic: 0 },
     { id: "../../etc", name: "bad id", kind: "node", members: 1, delay: 1, alive: true, traffic: 0 }
@@ -40,7 +40,7 @@ const sample = {
 const s = M.parseStatus(JSON.stringify(sample))
 assert.ok(s)
 assert.strictEqual(s.running, true)
-assert.strictEqual(s.currentId, "7951707fd4")
+assert.strictEqual(s.currentId, "abcdefabcd")
 assert.strictEqual(s.exit.country, "FI")
 assert.strictEqual(s.exit.ip, "203.0.113.23")
 assert.strictEqual(s.selected, "")
@@ -80,8 +80,8 @@ assert.strictEqual(M.clip("<img src=\"https://example.invalid/t\">"), "<img src=
 assert.strictEqual(M.clip("a\nb\u0007c"), "a b c")
 
 // ---- ids and names that reach argv -----------------------------------------
-assert.ok(M.validNodeId("7951707fd4"))
-for (const bad of ["7951707FD4", "7951707fd", "7951707fd45", "auto", "; rm -rf ~", "", null, 12])
+assert.ok(M.validNodeId("abcdefabcd"))
+for (const bad of ["ABCDEFABCD", "abcdefabc", "abcdefabcde", "auto", "; rm -rf ~", "", null, 12])
   assert.ok(!M.validNodeId(bad), String(bad))
 assert.ok(M.validSubscriptionName("Other", s.subscriptions))
 assert.ok(!M.validSubscriptionName("--help", s.subscriptions))
@@ -121,7 +121,7 @@ assert.strictEqual(M.restartNeeded("0.0.1"), false)
 // ---- sorting and filtering -----------------------------------------------------
 const sorted = M.sortNodes(s.nodes).map(n => n.name)
 assert.strictEqual(JSON.stringify(sorted), JSON.stringify(["🇫🇮 Helsinki 1", "🇩🇪 Frankfurt 1", "Fresh", "Dead"]))
-assert.strictEqual(JSON.stringify(M.filterNodes(s.nodes, "frank").map(n => n.id)), JSON.stringify(["64681dfc38"]))
+assert.strictEqual(JSON.stringify(M.filterNodes(s.nodes, "frank").map(n => n.id)), JSON.stringify(["0123456789"]))
 assert.strictEqual(JSON.stringify(M.filterNodes(s.nodes, "  ").length), JSON.stringify(4))
 assert.strictEqual(M.aliveCount(s.nodes), 2)
 assert.strictEqual(M.delayState(s.nodes[0]), "fast")
@@ -174,36 +174,36 @@ assert.strictEqual(M.parseStatus(JSON.stringify(Object.assign({}, sample, { rece
 
 // ---- the frozen order --------------------------------------------------------
 const o1 = M.nodeOrder(s.nodes, "")
-assert.deepStrictEqual(Array.from(o1.live), ["7951707fd4", "64681dfc38", "bbbbbbbbbb"])  // fastest first, unprobed after
+assert.deepStrictEqual(Array.from(o1.live), ["abcdefabcd", "0123456789", "bbbbbbbbbb"])  // fastest first, unprobed after
 assert.deepStrictEqual(Array.from(o1.dead), ["aaaaaaaaaa"])
-assert.deepStrictEqual(Array.from(M.listKeys(o1, false)), ["7951707fd4", "64681dfc38", "bbbbbbbbbb", "fold"])
-assert.deepStrictEqual(Array.from(M.listKeys(o1, true)), ["7951707fd4", "64681dfc38", "bbbbbbbbbb", "fold", "aaaaaaaaaa"])
+assert.deepStrictEqual(Array.from(M.listKeys(o1, false)), ["abcdefabcd", "0123456789", "bbbbbbbbbb", "fold"])
+assert.deepStrictEqual(Array.from(M.listKeys(o1, true)), ["abcdefabcd", "0123456789", "bbbbbbbbbb", "fold", "aaaaaaaaaa"])
 assert.deepStrictEqual(Array.from(M.listKeys({ live: ["a"], dead: [] }, true)), ["a"])  // no fold row without dead nodes
 // A poll where Frankfurt became faster than Helsinki: the order does not move.
-const faster = s.nodes.map(n => Object.assign({}, n, n.id === "64681dfc38" ? { delay: 5 } : {}))
+const faster = s.nodes.map(n => Object.assign({}, n, n.id === "0123456789" ? { delay: 5 } : {}))
 const o2 = M.reconcileOrder(o1, faster, "")
 assert.ok(M.sameOrder(o1, o2))
 // ...but a fresh open sorts again.
-assert.strictEqual(M.nodeOrder(faster, "").live[0], "64681dfc38")
+assert.strictEqual(M.nodeOrder(faster, "").live[0], "0123456789")
 // A vanished node drops out, a new one is appended to its group.
 const changed = faster.filter(n => n.id !== "bbbbbbbbbb").concat([
   { id: "cccccccccc", name: "New", group: false, members: 1, delay: 1, alive: true, traffic: 0 },
   { id: "dddddddddd", name: "Gone", group: false, members: 1, delay: null, alive: false, traffic: 0 }])
 const o3 = M.reconcileOrder(o1, changed, "")
-assert.deepStrictEqual(Array.from(o3.live), ["7951707fd4", "64681dfc38", "cccccccccc"])
+assert.deepStrictEqual(Array.from(o3.live), ["abcdefabcd", "0123456789", "cccccccccc"])
 assert.deepStrictEqual(Array.from(o3.dead), ["aaaaaaaaaa", "dddddddddd"])
 // The search narrows new arrivals too.
-assert.deepStrictEqual(Array.from(M.reconcileOrder(M.nodeOrder(s.nodes, "hel"), changed, "hel").live), ["7951707fd4"])
+assert.deepStrictEqual(Array.from(M.reconcileOrder(M.nodeOrder(s.nodes, "hel"), changed, "hel").live), ["abcdefabcd"])
 // The cursor is a key: it moves by position in the current rows and clamps.
 const keys = M.listKeys(o1, false)
 assert.strictEqual(M.moveKey(keys, "", 1), "auto")
-assert.strictEqual(M.moveKey(keys, "auto", 1), "7951707fd4")
-assert.strictEqual(M.moveKey(keys, "64681dfc38", -1), "7951707fd4")
+assert.strictEqual(M.moveKey(keys, "auto", 1), "abcdefabcd")
+assert.strictEqual(M.moveKey(keys, "0123456789", -1), "abcdefabcd")
 assert.strictEqual(M.moveKey(keys, "fold", 1), "fold")
 assert.strictEqual(M.moveKey(keys, "auto", -1), "auto")
 // After a reorder elsewhere the cursor stays on its node, wherever it went.
-const reordered = { live: ["64681dfc38", "7951707fd4", "bbbbbbbbbb"], dead: ["aaaaaaaaaa"] }
-assert.strictEqual(M.moveKey(M.listKeys(reordered, false), "7951707fd4", 1), "bbbbbbbbbb")
+const reordered = { live: ["0123456789", "abcdefabcd", "bbbbbbbbbb"], dead: ["aaaaaaaaaa"] }
+assert.strictEqual(M.moveKey(M.listKeys(reordered, false), "abcdefabcd", 1), "bbbbbbbbbb")
 
 // 562 nodes: order, search and reconcile stay cheap and correct.
 const bigOrder = M.nodeOrder(big, "")
@@ -215,7 +215,7 @@ assert.ok(M.sameOrder(bigOrder, M.reconcileOrder(bigOrder, big, "")))
 assert.strictEqual(M.nodeOrder(big, "node 56").live.length + M.nodeOrder(big, "node 56").dead.length, 3)
 
 // ---- the header line ----------------------------------------------------------
-const nodeMode = M.parseStatus(JSON.stringify(Object.assign({}, sample, { mode: "node", selected: "64681dfc38", current: "🇩🇪 Frankfurt 1", current_id: "64681dfc38" })))
+const nodeMode = M.parseStatus(JSON.stringify(Object.assign({}, sample, { mode: "node", selected: "0123456789", current: "🇩🇪 Frankfurt 1", current_id: "0123456789" })))
 const hp = M.heroParts(nodeMode, s.nodes)
 assert.deepStrictEqual([hp.country, hp.ip, hp.delay], ["FI", "203.0.113.23", 913])
 assert.strictEqual(M.heroParts(nodeMode, []).delay, null)
@@ -294,8 +294,8 @@ for (const [k, v] of Object.entries(en)) {
 
 // ---- fallback, notifications, rules (CLI round 2) ---------------------------
 const fbRaw = Object.assign({}, sample, {
-  mode: "node", selected: "64681dfc38",
-  fallback: { enabled: true, node: "7951707fd4", node_name: "🇫🇮 Helsinki 1", active: true, ready: true,
+  mode: "node", selected: "0123456789",
+  fallback: { enabled: true, node: "abcdefabcd", node_name: "🇫🇮 Helsinki 1", active: true, ready: true,
               problem: null, restart_needed: false },
   notify: false,
   rules: { direct: ["example.com", "Bad Host", "example.org", "example.com", "a_b.com"], tunnel: ["1.1.1.1", "x.com/p"] },
@@ -306,7 +306,7 @@ const fbRaw = Object.assign({}, sample, {
 const fb = M.parseStatus(JSON.stringify(fbRaw))
 assert.strictEqual(fb.fallback.enabled, true)
 assert.strictEqual(fb.fallback.active, true)
-assert.strictEqual(fb.fallback.node, "7951707fd4")
+assert.strictEqual(fb.fallback.node, "abcdefabcd")
 assert.strictEqual(fb.notify, false)
 assert.strictEqual(fb.notifyKnown, true)
 assert.deepStrictEqual(Array.from(fb.rules.direct), ["example.com", "example.org"])
@@ -333,9 +333,9 @@ assert.deepStrictEqual(JSON.parse(JSON.stringify(M.ruleRows(fb.rules))), [
   { host: "example.com", side: "direct" }, { host: "example.org", side: "direct" }, { host: "1.1.1.1", side: "tunnel" }])
 // Fallback candidates: plain nodes that answer, not the selected one, fastest
 // first; the chosen one stays even when dead.
-assert.deepStrictEqual(Array.from(M.fallbackCandidates(s.nodes, "64681dfc38", "").map(n => n.id)), ["7951707fd4"])
-assert.deepStrictEqual(Array.from(M.fallbackCandidates(s.nodes, "64681dfc38", "aaaaaaaaaa").map(n => n.id)), ["7951707fd4", "aaaaaaaaaa"])
-assert.deepStrictEqual(Array.from(M.fallbackCandidates(s.nodes, "", "").map(n => n.id)), ["7951707fd4", "64681dfc38"])
+assert.deepStrictEqual(Array.from(M.fallbackCandidates(s.nodes, "0123456789", "").map(n => n.id)), ["abcdefabcd"])
+assert.deepStrictEqual(Array.from(M.fallbackCandidates(s.nodes, "0123456789", "aaaaaaaaaa").map(n => n.id)), ["abcdefabcd", "aaaaaaaaaa"])
+assert.deepStrictEqual(Array.from(M.fallbackCandidates(s.nodes, "", "").map(n => n.id)), ["abcdefabcd", "0123456789"])
 
 // ---- core status ------------------------------------------------------------
 const core = M.parseCoreStatus('{"version": "26.10.31", "path": "/x", "latest": "26.11.9", "latest_published": "2026-11-09T05:31:16Z", "latest_checked": 1794992543, "update_available": true, "check_error": null, "prev": false, "prev_version": null, "in_progress": false, "update": null}')
@@ -414,3 +414,61 @@ assert.strictEqual(unpinned.unpinnedRelease, "26.12.1")
 assert.strictEqual(M.parseCoreStatus('{"version": "26.11.9", "latest": "26.11.9", "release": "26.11.9", "release_pinned": true}').unpinnedRelease, "")
 
 console.log("test_model.js first-run checks passed")
+
+// ---- checked sites ------------------------------------------------------------
+assert.strictEqual(M.siteUrl("https://www.youtube.com/generate_204"), "https://www.youtube.com/generate_204")
+assert.strictEqual(M.siteUrl("  https://ya.ru/  "), "https://ya.ru/")
+for (const bad of ["http://ya.ru/", "https://u:p@ya.ru/", "https://ya.ru/a b", "ya.ru", "https://",
+                   "https://ya.ru/\u00e9", "https://ya.ru/\u0007", "https://" + "a".repeat(2000) + ".ru/", "", null])
+  assert.strictEqual(M.siteUrl(bad), "", "refused: " + String(bad).substring(0, 30))
+assert.strictEqual(M.siteName("", "https://www.youtube.com/generate_204"), "www.youtube.com")
+assert.strictEqual(M.siteName("YouTube", "https://www.youtube.com/"), "YouTube")
+assert.strictEqual(M.siteName("-x", "https://ya.ru/"), "")
+
+// No `sites` from an older CLI: nothing on screen, and no switch.
+assert.strictEqual(s.sites.known, false)
+assert.strictEqual(s.sites.items.length, 0)
+assert.strictEqual(M.sitesStale(s, 90), false)
+const siteSample = Object.assign({}, sample, { sites: {
+  checked: 1794982080, tunnel: true, notify: true,
+  items: [
+    { name: "Internet", host: "ya.ru", result: { ok: true, status: 302, ms: 136.4, error: "", via: "direct", node: "", why: "geo", source: "log" } },
+    { name: "YouTube", host: "www.youtube.com", result: { ok: false, status: null, ms: null, error: "timeout", via: "tunnel", node: "🇩🇪 Frankfurt 1", why: "", source: "log" } },
+    { name: "New", host: "example.org", result: null },
+    { name: "", host: "x" }, "junk",
+    { name: "Weird", host: "x.org", result: { ok: false, error: "Bad Code", via: "sideways", why: "magic", status: 99999, ms: -5 } }
+  ] } })
+const ws = M.parseStatus(JSON.stringify(siteSample))
+assert.strictEqual(ws.sites.known, true)
+assert.strictEqual(ws.sites.notify, true)
+assert.strictEqual(ws.sites.items.map(i => i.name).join(), "Internet,YouTube,New,Weird")
+assert.strictEqual(ws.sites.items[0].result.ms, 136)
+assert.strictEqual(ws.sites.items[0].result.fromLog, true)
+assert.strictEqual(ws.sites.items[1].result.node, "🇩🇪 Frankfurt 1")
+assert.strictEqual(ws.sites.items[2].result, null)
+// Anything the panel does not know is bounded: an unknown error is "other",
+// an odd path is the tunnel with no reason, a status out of range is none.
+const weird = ws.sites.items[3].result
+assert.strictEqual(weird.error, "other")
+assert.strictEqual(weird.via, "tunnel")
+assert.strictEqual(weird.why, "")
+assert.strictEqual(weird.status, 0)
+assert.strictEqual(weird.ms, null)
+const sum = M.siteSummary(ws.sites)
+assert.strictEqual([sum.total, sum.ok, sum.failed.join(), sum.unchecked].join("|"), "4|1|YouTube,Weird|1")
+assert.strictEqual(M.validSiteName("YouTube", ws.sites), true)
+assert.strictEqual(M.validSiteName("--json", ws.sites), false)
+// Stale: a site never checked here.
+assert.strictEqual(M.sitesStale(ws, 90), true)
+const fresh2 = M.parseStatus(JSON.stringify(Object.assign({}, siteSample, { sites: Object.assign({}, siteSample.sites,
+  { items: siteSample.sites.items.slice(0, 2) }) })))
+assert.strictEqual(M.sitesStale(fresh2, 90), false)
+// Older than 90 s by the CLI's clock, or made with the tunnel in the other state.
+assert.strictEqual(M.sitesStale(Object.assign({}, fresh2, { time: fresh2.sites.checked + 91 }), 90), true)
+assert.strictEqual(M.sitesStale(Object.assign({}, fresh2, { running: false }), 90), true)
+// Capped at ten, names clipped to 40.
+const many = M.parseStatus(JSON.stringify(Object.assign({}, sample, { sites: { items:
+  Array.from({ length: 50 }, (_, i) => ({ name: "n".repeat(100) + i, host: "h", result: null })) } })))
+assert.strictEqual(many.sites.items.length, 10)
+assert.ok(many.sites.items[0].name.length <= 40)
+console.log("test_model.js site checks passed")

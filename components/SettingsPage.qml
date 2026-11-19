@@ -5,10 +5,14 @@ import qs.Commons as Commons
 import qs.Ui
 import "../Model.js" as Model
 
-// Three quiet options, off the main screen.
+// Four quiet options, off the main screen.
 //
 // Notifications: the watcher (xray-omarchy-watch) tells the desktop when protection
 // drops, a node goes down or the fallback takes over. One switch.
+//
+// Site notifications: the same watcher, about the checked sites (Sites page)
+// — one that stops opening (three checks in a row) and comes back. Its own
+// switch, under the first: notifications off silences these too.
 //
 // Russia preset: off by default, everything goes through the tunnel. On, the
 // Russian sites (geosite category-ru, geoip ru, the zones ru, su, xn--p1ai) go direct
@@ -46,6 +50,10 @@ Column {
   readonly property string selectedId: nodeMode ? status.selected : ""
   readonly property var candidates: fallback ? Model.fallbackCandidates(service.nodes, selectedId, fallback.node) : []
   readonly property bool notifyOn: service.wantedNotify !== -1 ? service.wantedNotify === 1 : (status !== null && status.notify)
+  readonly property bool siteNotifyOn: service.wantedSiteNotify !== -1 ? service.wantedSiteNotify === 1
+    : (status !== null && status.sites.notify)
+  // The site notifications row only once there is a site to check.
+  readonly property bool hasSites: status !== null && status.sites.known && status.sites.items.length > 0
   readonly property bool russiaOn: service.wantedPreset !== -1 ? service.wantedPreset === 1
     : (status !== null && status.presets.russia === true)
 
@@ -122,6 +130,60 @@ Column {
   }
 
   PanelSeparator {
+    width: parent.width
+    foreground: root.textColor
+  }
+
+  // ---- site notifications ------------------------------------------------------
+  Item {
+    visible: root.hasSites
+    width: parent.width
+    implicitHeight: Math.max(siteNotifyLabels.implicitHeight, siteNotifySwitch.implicitHeight)
+
+    Column {
+      id: siteNotifyLabels
+      anchors.left: parent.left
+      anchors.right: siteNotifySwitch.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.strings.t("settings.siteNotify")
+        color: root.textColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+        elide: Text.ElideRight
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: root.strings.t(root.notifyOn ? "settings.siteNotifyHint" : "settings.siteNotifyMuted")
+        color: root.dim
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+
+    ToggleSwitch {
+      id: siteNotifySwitch
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      checked: root.siteNotifyOn
+      busy: root.service.wantedSiteNotify !== -1
+      opacity: root.notifyOn ? 1.0 : 0.45
+      cursorRing: false
+      foreground: root.textColor
+      onToggled: root.service.setSiteNotify(!root.siteNotifyOn)
+    }
+  }
+
+  PanelSeparator {
+    visible: root.hasSites
     width: parent.width
     foreground: root.textColor
   }

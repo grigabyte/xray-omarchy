@@ -29,15 +29,21 @@ test stand only: with them the commands work on a copy and leave the live core a
 """
 import argparse
 import base64
+import errno
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import platform
 import re
+import socket
+import ssl
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse as up
@@ -49,7 +55,7 @@ def _env(name, default):
 
 
 NAME = "xray-omarchy"
-VERSION = "0.6.3"
+VERSION = "0.7.0"
 HOME = os.path.expanduser("~")
 CONF_DIR = _env("XRAY_OMARCHY_CONF_DIR", os.path.join(HOME, ".config", NAME))
 STATE_DIR = _env("XRAY_OMARCHY_STATE_DIR", os.path.join(HOME, ".local/state", NAME))
@@ -82,6 +88,8 @@ TRAFFIC_FILE = os.path.join(STATE_DIR, "traffic.json")
 EXIT_FILE = os.path.join(STATE_DIR, "exit.json")
 CORE_STATE = os.path.join(STATE_DIR, "core.json")
 WATCH_DAILY = os.path.join(STATE_DIR, "watch-daily.json")
+# The last check of the sites (`site check`, the watcher): names, results, no secrets.
+SITES_FILE = os.path.join(STATE_DIR, "sites.json")
 LOG_FILE = os.path.join(STATE_DIR, "xray-omarchy.log")
 ACCESS_LOG = os.path.join(RUN_DIR, "access.log")
 ERROR_LOG = os.path.join(RUN_DIR, "error.log")
@@ -180,13 +188,22 @@ def read_json(path, default):
 
 
 def write_private(path, data, binary=False):
-    """Write through a temporary file with mode 0600: an interruption never leaves half a file."""
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb" if binary else "w", **({} if binary else {"encoding": "utf8"})) as fh:
-        fh.write(data)
-    os.replace(tmp, path)
+    """Write through a temporary file with mode 0600: an interruption never leaves half a file.
+    The temporary file has a name of its own (mkstemp, in the same directory), so two
+    writers of one file never write into the same temporary one."""
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "wb" if binary else "w", **({} if binary else {"encoding": "utf8"})) as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_json(path, obj):
@@ -1972,13 +1989,17 @@ def recent_connections(names, limit=60, rules=None):
     rules = rules or load_rules()
     lines = tail(ACCESS_LOG, 4000)
     ip_name = ip_names()
+    probes = load_probes()
     out = []
     for line in lines:
         a = ACCESS_RE.match(line)
         if not a:
             continue
-        ts, _src, proto, host, port, route = a.groups()
+        ts, src, proto, host, port, route = a.groups()
         if not route.startswith("tun"):
+            continue
+        # The site checks' own requests are not the user's connections.
+        if is_probe(probes, ts, src, host.strip("[]"), port):
             continue
         outbound = DETOUR_RE.split(route.strip())[-1]
         if outbound == "dns-out":
@@ -2145,6 +2166,8 @@ def gather(with_nodes=False, refresh_exit=False):
         "recent": recent_connections(names, rules=rules) if running else [],
         "rules": rules,
         "notify": notify_enabled(),
+        # The sites to check and their last result; no network here.
+        "sites": sites_status(),
         "presets": preset_state(),
         "network": network_status(),
         "errors": recent_errors() if running else [],
@@ -2219,6 +2242,11 @@ def cmd_status(args):
             print("  %s  %-6s %s" % (n["id"], "%dms" % n["delay"] if n["delay"] else "-", n["name"]))
     for e in state["errors"][-5:]:
         print("error:       %s" % e[:150])
+    for item in state["sites"]["items"]:
+        r = item["result"]
+        print("site:        %s %s" % (item["name"], "not checked yet" if not r else
+                                       ("ok, %s ms, %s" % (r.get("ms"), site_way(r)) if r.get("ok")
+                                        else "FAIL, %s, %s" % (site_error_text(r), site_way(r)))))
     return 0
 
 
@@ -2329,6 +2357,492 @@ def cmd_preset(args):
         return finish(args, True, "restarted", args.action, text + "; core restarted")
     return finish(args, True, "restart_needed", args.action,
                   text + "; applies on core restart: run again with --apply")
+
+
+# ---------------------------------------------------------------- check sites
+
+# A few sites the user wants to keep an eye on: does each one open, and which
+# way does it go — through which node, direct by a preset or a rule, or direct
+# because the tunnel is off. The check is one HTTPS request sent the way any
+# program on this machine sends it, so it takes the same path; the path is
+# then read back from the core's access log by the request's own local port.
+SITE_MAX = 10
+SITE_URL_MAX = 2000
+# For all sites together (they run at once); a slow node gets the time a
+# browser would give it.
+SITE_TIMEOUT = 10
+# The core writes the access log line as it dispatches the connection; a
+# moment's grace for it to land.
+SITE_LOG_WAIT = 1.5
+SITE_EVERY = 60
+# Failed checks in a row before "unreachable": one slow minute is not an outage.
+SITE_CONFIRM = 3
+# The request carries what an ordinary browser sends (Firefox on Linux), not
+# this program's name: a site checked direct sees the user's real address, and
+# must not learn from the request that a VPN client runs here.
+SITE_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0"
+SITE_HEADERS = ("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                "Accept-Language: en-US,en;q=0.5\r\n")
+# The checks' own connections (local port, address, port, when), kept next to
+# the core's log so `recent` can leave them out; only as long as the log holds
+# lines that old.
+SITE_PROBES = os.path.join(RUN_DIR, "site-probes.json")
+SITE_PROBES_MAX = 5000
+SITE_RESULT_KEYS = ("ok", "status", "ms", "error", "via", "node", "why", "source")
+# Why a check failed, as codes (the panel words them); this is the terminal's text.
+SITE_ERROR_TEXT = {
+    "timeout": "no answer in %d s" % SITE_TIMEOUT,
+    "dns_failed": "the name does not resolve",
+    "refused": "connection refused",
+    "reset": "connection reset",
+    "tls_cert": "certificate check failed",
+    "tls_failed": "TLS handshake failed",
+    "unreachable": "network unreachable",
+    "bad_answer": "not an HTTP answer",
+    "http_status": "answered %s",
+    "other": "failed",
+}
+SITE_URL_RE = re.compile(r"[\x21-\x7e]+")
+
+
+def site_url(text):
+    """An https link a check may open, as {url, host, port, target}, or None.
+    One line of printable ASCII, at most 2000 characters, no user or password
+    (nothing secret goes into a check), a host that is a domain or an IPv4
+    address."""
+    url = text.strip() if isinstance(text, str) else ""
+    if not url or len(url) > SITE_URL_MAX or not SITE_URL_RE.fullmatch(url):
+        return None
+    try:
+        parts = up.urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "https" or "@" in parts.netloc or not parts.hostname:
+        return None
+    host, _ = normalize_host(parts.hostname)
+    if not host:
+        return None
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    return {"url": url, "host": host, "port": port or 443, "target": target}
+
+
+def load_sites(raw=None):
+    """check_sites from settings.json without junk: a usable name and link,
+    one entry per name, at most SITE_MAX."""
+    raw = read_json(SETTINGS_FILE, {}) if raw is None else raw
+    items = raw.get("check_sites") if isinstance(raw, dict) else None
+    out, seen = [], set()
+    for item in items if isinstance(items, list) else []:
+        if len(out) >= SITE_MAX or not isinstance(item, dict):
+            continue
+        name = item.get("name").strip() if isinstance(item.get("name"), str) else ""
+        u = site_url(item.get("url"))
+        if not SUB_NAME_RE.fullmatch(name) or u is None or name in seen:
+            continue
+        seen.add(name)
+        out.append({"name": name, "url": u["url"]})
+    return out
+
+
+def site_notify_enabled(raw=None):
+    raw = read_json(SETTINGS_FILE, {}) if raw is None else raw
+    return bool(raw.get("site_notify", True)) if isinstance(raw, dict) else True
+
+
+def route_from_log(lines, src_port, ip="", port=None):
+    """The outbound the core gave one connection, found in its access log by the
+    connection's local port (and its address and port, when known); the newest
+    line wins. None when the log does not have it."""
+    want = ":%d" % src_port
+    for line in reversed(lines):
+        a = ACCESS_RE.match(line)
+        if not a:
+            continue
+        _ts, src, _proto, dest, dport, route = a.groups()
+        if not route.startswith("tun") or not src.endswith(want):
+            continue
+        if (ip and dest.strip("[]") != ip) or (port and int(dport) != port):
+            continue
+        return DETOUR_RE.split(route.strip())[-1]
+    return None
+
+
+def log_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def read_from(path, offset, max_bytes=2_000_000):
+    """The lines a log gained since `offset` (a size taken earlier). A log that
+    became shorter was trimmed in between: then all of it."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(offset if offset <= size else 0)
+            return fh.read(max_bytes).decode("utf8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def log_time(ts):
+    """A line's time in the core's log ("2026/11/19 16:07:24.605763", local) as epoch seconds."""
+    try:
+        return time.mktime(time.strptime(ts[:19], "%Y/%m/%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def first_log_time(path):
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096).decode("utf8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in head:
+        a = ACCESS_RE.match(line)
+        if a:
+            return log_time(a.group(1))
+    return None
+
+
+def remember_probes(started, boxes):
+    """Notes the checks' own connections, so `recent` does not count them as the
+    user's. Entries older than the log's first line can match nothing and go."""
+    new = [[int(started), b["src_port"], b["ip"], b["port"]] for b in boxes if b.get("src_port") and b.get("ip")]
+    if not new:
+        return
+    try:
+        os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+        with open(SITE_PROBES + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            raw = read_json(SITE_PROBES, {})
+            old = raw.get("probes") if isinstance(raw, dict) else None
+            oldest = first_log_time(ACCESS_LOG)
+            keep = [p for p in old or [] if isinstance(p, list) and len(p) == 4
+                    and (oldest is None or p[0] >= oldest - SITE_TIMEOUT - 60)]
+            write_json(SITE_PROBES, {"probes": (keep + new)[-SITE_PROBES_MAX:]})
+    except OSError:
+        pass
+
+
+def load_probes():
+    """{(local port, address, port): [start times]} of the checks' own connections."""
+    raw = read_json(SITE_PROBES, {})
+    out = {}
+    for p in (raw.get("probes") if isinstance(raw, dict) else None) or []:
+        if isinstance(p, list) and len(p) == 4:
+            out.setdefault((p[1], p[2], p[3]), []).append(p[0])
+    return out
+
+
+def is_probe(probes, ts, src, ip, port):
+    """Whether one access-log line is a site check's own connection: the same
+    local port, address and port, within the check's time (ports are reused)."""
+    if not probes:
+        return False
+    try:
+        key = (int(src.rsplit(":", 1)[1]), ip, int(port))
+    except (IndexError, ValueError):
+        return False
+    starts = probes.get(key)
+    if not starts:
+        return False
+    t = log_time(ts)
+    return t is not None and any(s - 2 <= t <= s + SITE_TIMEOUT + 3 for s in starts)
+
+
+def _in_zones(host, zones):
+    return any(host == z or host.endswith("." + z) for z in zones)
+
+
+def site_local(host, ip, st):
+    """What the config always sends direct: private and local addresses, LAN names."""
+    if ip:
+        try:
+            if ipaddress.ip_address(ip).is_private or in_nets(ip, st["local_nets"]):
+                return True
+        except ValueError:
+            pass
+    return _in_zones(host, st["lan_domains"])
+
+
+def site_path(host, ip, outbound, running, rules, st, names, current=""):
+    """{via, node, why, source}: which way a check went. From the core's log when
+    it holds the connection (source "log"); otherwise worked out from the rules
+    (source "rules"): the tunnel off, a site rule, a local address or a direct
+    zone, else the tunnel. geosite and geoip lists cannot be read here, so a
+    site they send direct is only known from the log.
+    why: "rule" (a site rule, rules.json), "local", "geo" (direct_geo: a preset
+    or the user's own lists), "tunnel_off", or "" (the tunnel, by default)."""
+    if not running:
+        return {"via": "direct", "node": "", "why": "tunnel_off", "source": "rules"}
+    rule = rule_for(host, ip, rules)
+    if outbound:
+        via = "direct" if outbound == "direct" else "block" if outbound == "block" else "tunnel"
+        source = "log"
+    else:
+        source = "rules"
+        if rule:
+            via = rule
+        elif site_local(host, ip, st) or _in_zones(host, st["direct_geo"]["domains"]):
+            via = "direct"
+        else:
+            via = "tunnel"
+    if rule == via:
+        why = "rule"
+    elif via == "direct":
+        why = "local" if site_local(host, ip, st) else "geo"
+    else:
+        why = ""
+    node = ""
+    if via == "tunnel":
+        node = names.get(outbound, outbound) if outbound else (current() if callable(current) else current)
+    return {"via": via, "node": node or "", "why": why, "source": source}
+
+
+def check_site(u, deadline, out, note=None):
+    """One HTTPS GET to the site, as any program here sends it (through the
+    tunnel while it runs), into `out`. A redirect is not followed: it is an
+    answer, and the site opens. ok: an answer below 400. `note`, when given,
+    is told the connection (out) before it is made, so that `recent` already
+    knows it for the check's own while it runs."""
+    start = time.monotonic()
+
+    def left():
+        rest = deadline - time.monotonic()
+        if rest <= 0:
+            raise TimeoutError()
+        return rest
+
+    try:
+        # IPv4 only: the tunnel carries IPv4, and the killswitch refuses IPv6.
+        info = socket.getaddrinfo(u["host"], u["port"], socket.AF_INET, socket.SOCK_STREAM)
+        out["ip"] = info[0][4][0]
+        # The local port is taken before connecting, so even a connection that
+        # never completes can be found in the core's log.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("0.0.0.0", 0))
+            out["src_port"] = sock.getsockname()[1]
+            if note:
+                note(dict(out, port=u["port"]))
+            sock.settimeout(left())
+            sock.connect((out["ip"], u["port"]))
+            tls = ssl.create_default_context().wrap_socket(sock, server_hostname=u["host"])
+        except BaseException:
+            sock.close()
+            raise
+        with tls:
+            tls.settimeout(left())
+            host = u["host"] if u["port"] == 443 else "%s:%d" % (u["host"], u["port"])
+            tls.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n%sConnection: close\r\n\r\n"
+                         % (u["target"], host, SITE_UA, SITE_HEADERS)).encode("ascii"))
+            resp = http.client.HTTPResponse(tls, method="GET")
+            resp.begin()
+            out["status"] = resp.status
+        out["ms"] = int((time.monotonic() - start) * 1000)
+        out["ok"] = out["status"] < 400
+        out["error"] = "" if out["ok"] else "http_status"
+    except socket.gaierror:
+        out["error"] = "dns_failed"
+    except TimeoutError:
+        out["error"] = "timeout"
+    except ssl.SSLCertVerificationError:
+        out["error"] = "tls_cert"
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError,
+            ssl.SSLZeroReturnError):
+        out["error"] = "reset"
+    except ssl.SSLError:
+        out["error"] = "tls_failed"
+    except ConnectionRefusedError:
+        out["error"] = "refused"
+    except http.client.HTTPException:
+        out["error"] = "bad_answer"
+    except OSError as error:
+        out["error"] = "unreachable" if error.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH) else "other"
+    except Exception:
+        out["error"] = "other"
+    out["done"] = True
+    return out
+
+
+def run_site_checks(sites=None, write=True):
+    """Checks every site at once (threads under one deadline: a name lookup has
+    no timeout of its own), then reads the way each one went from the core's
+    log. The result is kept in SITES_FILE for `status` and the panel."""
+    sites = load_sites() if sites is None else sites
+    running = service_active()
+    # Where the core's log ends now: the checks' lines come after it.
+    log_start = log_size(ACCESS_LOG) if running else 0
+    started = time.time()
+    deadline = time.monotonic() + SITE_TIMEOUT
+    jobs = []
+    # Each connection is noted as it is made, before the core logs it.
+    note = (lambda b: remember_probes(started, [b])) if running else None
+    for site in sites:
+        u = site_url(site["url"])
+        box = {"ok": False, "status": 0, "ms": None, "error": "", "ip": "", "src_port": 0, "done": False}
+        thread = threading.Thread(target=check_site, args=(u, deadline, box, note), daemon=True)
+        thread.start()
+        jobs.append((site, u, box, thread))
+    for _site, _u, _box, thread in jobs:
+        thread.join(max(0.0, deadline + 0.5 - time.monotonic()))
+    # A copy: a lookup that outlived the deadline may still write into its box.
+    done = [(site, u, dict(box) if box["done"] else dict(box, error="timeout", ok=False))
+            for site, u, box, _thread in jobs]
+
+    routes = {}
+    if running:
+        wanted = [(i, b) for i, (_s, _u, b) in enumerate(done) if b["src_port"]]
+        stop = time.monotonic() + SITE_LOG_WAIT
+        while wanted:
+            lines = read_from(ACCESS_LOG, log_start)
+            for i, b in wanted:
+                if i not in routes:
+                    found = route_from_log(lines, b["src_port"], b["ip"], done[i][1]["port"])
+                    if found:
+                        routes[i] = found
+            if len(routes) == len(wanted) or time.monotonic() >= stop:
+                break
+            time.sleep(0.1)
+
+    names, cache = {}, {}
+    subs, selection, sid, nodes = active_nodes() if running else ([], {}, None, [])
+    for n in nodes:
+        for o in n["outbounds"]:
+            names[o["tag"]] = n["name"]
+
+    def current():
+        # Only for a check the log does not hold: the node the tunnel uses now.
+        if "node" not in cache:
+            _, chosen = target_for(selection, nodes) if nodes else (None, None)
+            if chosen:
+                cache["node"] = chosen["name"]
+            else:
+                _, pick = balancer_pick("auto")
+                cache["node"] = names.get(pick, pick or "")
+        return cache["node"]
+
+    rules, st = load_rules(), load_settings()
+    results = []
+    for i, (site, u, box) in enumerate(done):
+        path = site_path(u["host"], box["ip"], routes.get(i), running, rules, st, names, current)
+        results.append(dict({"name": site["name"], "url": u["url"], "host": u["host"], "ok": box["ok"],
+                             "status": box["status"] or None, "ms": box["ms"],
+                             "error": box["error"] if not box["ok"] else ""}, **path))
+    state = {"time": int(time.time()), "tunnel": running, "results": results}
+    if write:
+        write_json(SITES_FILE, state)
+    return state
+
+
+def sites_status(raw=None):
+    """For `status`: the sites with the last result of each (from the last
+    check, the watcher's or the panel's), no network."""
+    raw = read_json(SETTINGS_FILE, {}) if raw is None else raw
+    cache = read_json(SITES_FILE, {})
+    cache = cache if isinstance(cache, dict) else {}
+    last = {(r.get("name"), r.get("url")): r for r in cache.get("results") or [] if isinstance(r, dict)}
+    items = []
+    for s in load_sites(raw):
+        r = last.get((s["name"], s["url"]))
+        items.append({"name": s["name"], "host": site_url(s["url"])["host"],
+                      "result": {k: r.get(k) for k in SITE_RESULT_KEYS} if r else None})
+    return {"items": items, "checked": cache.get("time"), "tunnel": cache.get("tunnel"),
+            "notify": site_notify_enabled(raw)}
+
+
+def site_way(r):
+    """Which way a result went, in words for a notification or a terminal."""
+    if r.get("why") == "tunnel_off":
+        return "direct, tunnel off"
+    if r.get("via") == "tunnel":
+        return "via " + r["node"] if r.get("node") else "via the tunnel"
+    if r.get("via") == "block":
+        return "blocked"
+    return "direct by rule" if r.get("why") == "rule" else "direct"
+
+
+def site_error_text(r):
+    text = SITE_ERROR_TEXT.get(r.get("error") or "other", SITE_ERROR_TEXT["other"])
+    return text % (r.get("status") or "?") if "%s" in text else text
+
+
+def cmd_site(args):
+    raw = read_json(SETTINGS_FILE, {})
+    raw = raw if isinstance(raw, dict) else {}
+    sites = load_sites(raw)
+    if args.action == "list":
+        if args.json:
+            print(json.dumps(sites, ensure_ascii=False))
+        else:
+            for s in sites:
+                print("%-20s %s" % (s["name"], s["url"]))
+            if not sites:
+                print("no sites: xray-omarchy site add NAME URL")
+        return 0
+    if args.action == "add":
+        if not args.name or not args.url:
+            return finish(args, False, "usage", "", "usage: xray-omarchy site add NAME URL")
+        name = args.name.strip()
+        if not SUB_NAME_RE.fullmatch(name):
+            return finish(args, False, "invalid_name", "",
+                          "site name: 1-40 characters, no control characters, not starting with -")
+        url = args.url.strip()
+        if url.lower().startswith("http://"):
+            return finish(args, False, "insecure_url", "", "not added: only https links are checked")
+        u = site_url(url)
+        if u is None:
+            return finish(args, False, "invalid_url", "",
+                          "not added: one https link to a domain or an IPv4 address, no spaces, no user or "
+                          "password, at most %d characters" % SITE_URL_MAX)
+        at = [i for i, s in enumerate(sites) if s["name"] == name]
+        if not at and len(sites) >= SITE_MAX:
+            return finish(args, False, "too_many", str(SITE_MAX), "not added: at most %d sites" % SITE_MAX)
+        entry = {"name": name, "url": u["url"]}
+        if at:
+            sites[at[0]] = entry
+        else:
+            sites.append(entry)
+        raw["check_sites"] = sites
+        write_json(SETTINGS_FILE, raw)
+        return finish(args, True, "replaced" if at else "", name,
+                      "site %s %s: %s" % (name, "replaced" if at else "added", u["url"]))
+    if args.action == "rm":
+        name = (args.name or "").strip()
+        left = [s for s in sites if s["name"] != name]
+        if not name or len(left) == len(sites):
+            return finish(args, False, "not_found", name, "no site %s" % name)
+        raw["check_sites"] = left
+        write_json(SETTINGS_FILE, raw)
+        return finish(args, True, "", name, "site %s removed" % name)
+    if args.action == "notify":
+        if args.name in ("on", "off"):
+            raw["site_notify"] = args.name == "on"
+            write_json(SETTINGS_FILE, raw)
+        elif args.name:
+            return finish(args, False, "usage", "", "usage: xray-omarchy site notify on|off")
+        state = "on" if site_notify_enabled(raw) else "off"
+        return finish(args, True, "", state, "site notifications: %s" % state)
+    # check
+    result = run_site_checks(sites)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    if not sites:
+        print("no sites: xray-omarchy site add NAME URL")
+    for r in result["results"]:
+        print("%-20s %-4s %-28s %s%s" % (
+            r["name"], "ok" if r["ok"] else "FAIL",
+            ("%d ms" % r["ms"] if r["ok"] and r["ms"] is not None else site_error_text(r)),
+            site_way(r), "" if r["source"] == "log" or r["why"] == "tunnel_off" else " (from the rules)"))
+    return 0
 
 
 # ---------------------------------------------------------------- notifications
@@ -2464,6 +2978,39 @@ def watch_events(snap, memory, daily, confirm):
                            "%s: %s of %s used (%d%%)." % (name, human_bytes(used), human_bytes(total),
                                                          100 * used // total)))
             daily["traffic:" + name] = now
+
+    # Checked sites, only on the polls that carry a fresh check: SITE_CONFIRM
+    # failed checks in a row before "unreachable", one good one for "back", and
+    # one notification per change. The way named is this check's own: from the
+    # core's log, or from a rule, a local address or a direct zone; a failure
+    # the log does not hold and nothing decides (the name did not resolve, say)
+    # took no way, and says so.
+    if "sites" in snap:
+        mem = memory.setdefault("sites", {})
+        seen = set()
+        for r in snap.get("sites") or []:
+            if not isinstance(r, dict) or not isinstance(r.get("name"), str) or not r["name"]:
+                continue
+            name = r["name"]
+            seen.add(name)
+            m = mem.setdefault(name, {"state": "ok", "streak": 0})
+            m.pop("way", None)
+            if r.get("ok"):
+                if m.get("state") == "down":
+                    events.append(("site_up", "normal", "Site is back: %s (%s)" % (name, site_way(r)),
+                                   "It answers again, in %s ms." % (r.get("ms") if r.get("ms") is not None else "?")))
+                m.update(state="ok", streak=0)
+            else:
+                m["streak"] = m.get("streak", 0) + 1
+                if m["streak"] >= SITE_CONFIRM and m.get("state") != "down":
+                    known = r.get("source") == "log" or r.get("why") or r.get("via") != "tunnel"
+                    text = site_error_text(r)
+                    events.append(("site_down", "normal", "Site unreachable: %s (%s)"
+                                   % (name, site_way(r) if known else "way unknown"),
+                                   "%s, %d checks in a row." % (text[:1].upper() + text[1:], SITE_CONFIRM)))
+                    m["state"] = "down"
+        for name in [k for k in mem if k not in seen]:
+            del mem[name]
     return events
 
 
@@ -2473,18 +3020,41 @@ def cmd_watch(args):
     mem_path = args.memory or (args.state_file + ".memory.json" if fake else WATCH_FILE)
     daily_path = mem_path if fake else WATCH_DAILY
     confirm = 1 if fake else 2
+    # Sites are checked once a minute in a thread of their own, so a slow site
+    # never holds up the protection checks; the next poll carries the result.
+    sites = {"thread": None, "result": None, "last": 0.0}
+
+    def check_sites():
+        try:
+            sites["result"] = run_site_checks()
+        except Exception as error:
+            log("watch: site check: %s" % error)
+
     while True:
         try:
             snap = read_json(args.state_file, None) if fake else watch_snapshot()
             if snap is None:
                 raise ValueError("cannot read state file %s" % args.state_file)
+            if not fake:
+                if args.once and load_sites():
+                    check_sites()
+                if sites["result"] is not None:
+                    snap["sites"] = sites["result"]["results"]
+                    sites["result"] = None
+                elif not args.once and time.time() - sites["last"] >= SITE_EVERY and load_sites() \
+                        and not (sites["thread"] and sites["thread"].is_alive()):
+                    sites["last"] = time.time()
+                    sites["thread"] = threading.Thread(target=check_sites, daemon=True)
+                    sites["thread"].start()
             memory = read_json(mem_path, {})
             daily = read_json(daily_path, {}) if not fake else memory.setdefault("daily", {})
             events = watch_events(snap, memory, daily, confirm)
             sent = []
             enabled = notify_enabled()
+            site_alerts = site_notify_enabled()
             for code, urgency, summary, body in events:
-                ok = send_notification(summary, body, urgency) if enabled else False
+                allowed = enabled and (site_alerts or not code.startswith("site_"))
+                ok = send_notification(summary, body, urgency) if allowed else False
                 sent.append({"event": code, "urgency": urgency, "summary": summary, "body": body,
                              "sent": ok})
             write_json(mem_path, memory)
@@ -2954,6 +3524,12 @@ def main():
     s = sp.add_parser("notify", help="desktop notifications: on | off | status")
     s.add_argument("action", choices=["on", "off", "status"], nargs="?", default="status")
     s.add_argument("--json", action="store_true")
+    s = sp.add_parser("site", help="sites to check: list | add NAME URL | rm NAME | check | notify on|off")
+    s.add_argument("action", choices=["list", "add", "rm", "check", "notify"])
+    s.add_argument("name", nargs="?", help="NAME for add and rm; on|off for notify")
+    s.add_argument("url", nargs="?", help="add: an https link")
+    s.add_argument("--json", action="store_true",
+                   help="add/rm/notify: result as one JSON {ok, code, detail}; list/check: the data as JSON")
     s = sp.add_parser("watch", help="notify about tunnel events (service xray-omarchy-watch)")
     s.add_argument("--once", action="store_true", help="one poll, print events, exit")
     s.add_argument("--json", action="store_true", help="with --once: events as JSON")
@@ -2972,7 +3548,7 @@ def main():
     handlers = {"status": cmd_status, "on": cmd_on, "off": cmd_off, "select": cmd_select, "use": cmd_use,
                 "update": cmd_update, "sub": cmd_sub, "build": cmd_build, "net": cmd_net, "fw": cmd_fw,
                 "dns": cmd_dns, "trim": cmd_trim, "preset": cmd_preset, "fallback": cmd_fallback,
-                "rule": cmd_rule, "notify": cmd_notify, "watch": cmd_watch, "core": cmd_core}
+                "rule": cmd_rule, "notify": cmd_notify, "site": cmd_site, "watch": cmd_watch, "core": cmd_core}
     if not args.cmd:
         args = p.parse_args(["status"])
     if args.cmd == "core" and args.action == "install" and not args.target:

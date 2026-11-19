@@ -11,9 +11,11 @@ import "Model.js" as Model
 //
 // Every command is an argv array. Nothing is ever passed through a shell, and
 // the only values that reach argv from data are a node id that matched
-// ^[0-9a-f]{10}$, a subscription name the CLI itself reported and a host the
-// CLI itself reported (recent[] or rules) that matched Model.ruleHost — the
-// last two after "--", so neither can be read as an option.
+// ^[0-9a-f]{10}$, a subscription name the CLI itself reported, a host the
+// CLI itself reported (recent[] or rules) that matched Model.ruleHost and a
+// site name the CLI reported — the last three after "--", so none can be read
+// as an option. A new subscription or site from a form is checked by Model
+// and goes after "--" too.
 //
 // The panel draws from this cache. It is polled with the panel closed too, so
 // opening shows the last answer at once instead of an empty card that fills in
@@ -124,6 +126,14 @@ Item {
   // A direct preset in flight: -1 none, else the state asked for (russia).
   property int wantedPreset: -1
 
+  // Checked sites: a check in flight, a site being added or removed (its
+  // name), and the site notifications switch in flight (-1 none).
+  readonly property bool checkingSites: siteCheckProcess.running
+  property string pendingSite: ""
+  property bool addingSite: false
+  property int wantedSiteNotify: -1
+  property real _lastSiteCheck: 0
+
   // The xray core: the last `core status` answer (Model.parseCoreStatus),
   // whether the core page is on screen, and an update the panel started.
   property var core: null
@@ -228,6 +238,13 @@ Item {
       root.wantedRunning = -1
     // The switch follows the asked state until an answer after it lands.
     if (!notifyProcess.running) root.wantedNotify = -1
+    if (!siteNotifyProcess.running) root.wantedSiteNotify = -1
+    // The last site check no longer tells the truth (old, made with the
+    // tunnel in the other state, a site added since): a fresh one while the
+    // panel is open, at most every 30 s. Its answer changes words, not height.
+    // Not while the tunnel is being switched: the path would be neither.
+    if (root.panelOpen && root.wantedRunning === -1 && Model.sitesStale(next, 90)
+        && Date.now() - root._lastSiteCheck > 30000) root.checkSites()
     if (root.pendingUse !== "") {
       for (var i = 0; i < next.subscriptions.length; i++)
         if (next.subscriptions[i].active && next.subscriptions[i].name === root.pendingUse && next.running) {
@@ -806,6 +823,125 @@ Item {
       else root.say("preset.saved", "", false)
       root.pollFresh()
     }
+  }
+
+  // ---- checked sites ---------------------------------------------------------------
+
+  // `xray-omarchy site check --json`: one HTTPS request per site (10 s at most
+  // for all), the result kept by the CLI for `status`. Never in the regular
+  // poll: only when the panel is open and the last check is stale, and after
+  // a site is added.
+  function checkSites() {
+    if (siteCheckProcess.running) return
+    root._lastSiteCheck = Date.now()
+    siteCheckProcess.running = true
+  }
+
+  Process {
+    id: siteCheckProcess
+    running: false
+    command: [root.cli, "site", "check", "--json"]
+    onExited: function(exitCode) { root.pollFresh() }
+  }
+
+  // `xray-omarchy site add --json -- NAME URL`: both checked by Model.siteUrl /
+  // siteName and placed after "--".
+  signal siteAdded(string name)
+
+  function addSite(nameText, urlText) {
+    var url = Model.siteUrl(urlText)
+    var name = Model.siteName(nameText, url)
+    if (root.addingSite || siteProcess.running || url === "" || name === "") return false
+    root.addingSite = true
+    siteProcess.verb = "add"
+    siteProcess.name = name
+    siteProcess.command = [root.cli, "site", "add", "--json", "--", name, url]
+    siteProcess.running = true
+    return true
+  }
+
+  // `xray-omarchy site rm --json -- NAME`, a name the CLI reported.
+  function removeSite(name) {
+    if (siteProcess.running || !root.status || !Model.validSiteName(name, root.status.sites)) return false
+    root.pendingSite = name
+    siteProcess.verb = "rm"
+    siteProcess.name = name
+    siteProcess.command = [root.cli, "site", "rm", "--json", "--", name]
+    siteProcess.running = true
+    return true
+  }
+
+  Process {
+    id: siteProcess
+    property string verb: ""
+    property string name: ""
+    running: false
+    command: []
+    stdout: StdioCollector { id: siteOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = Model.parseResult(siteOut.text)
+      var adding = siteProcess.verb === "add"
+      root.addingSite = false
+      root.pendingSite = ""
+      if (result === null || !result.ok) {
+        root.say((adding ? "siteadd." : "siterm.") + (result !== null && result.code !== "" ? result.code : "other"),
+                 siteProcess.name, true)
+        root.pollFresh()
+        return
+      }
+      if (adding) {
+        root.say("notice.siteAdded", siteProcess.name, false)
+        root.siteAdded(siteProcess.name)
+        root.checkSites()
+      } else {
+        root.say("notice.siteRemoved", siteProcess.name, false)
+        root.pollFresh()
+      }
+    }
+  }
+
+  // `xray-omarchy site notify on|off --json`: whether the watcher tells the
+  // desktop when a checked site stops opening and comes back.
+  function setSiteNotify(on) {
+    if (siteNotifyProcess.running) return
+    root.wantedSiteNotify = on ? 1 : 0
+    siteNotifyProcess.command = [root.cli, "site", "notify", on ? "on" : "off", "--json"]
+    siteNotifyProcess.running = true
+  }
+
+  Process {
+    id: siteNotifyProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: siteNotifyOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      var result = Model.parseResult(siteNotifyOut.text)
+      if (result === null || !result.ok) {
+        root.wantedSiteNotify = -1
+        root.say("notice.siteNotifyFailed", String(exitCode), true)
+      }
+      root.pollFresh()
+    }
+  }
+
+  // Which way a checked site went and how it ended, in the catalog's words:
+  // "via Helsinki 1 · 164 ms", "direct · 136 ms", "direct by rule · 80 ms",
+  // "direct (tunnel off) · 120 ms"; a failure says why first.
+  function siteWay(r) {
+    if (r.why === "tunnel_off") return root.strings.t("sites.tunnelOff")
+    var way = r.via === "block" ? root.strings.t("sites.blocked")
+      : (r.via === "direct" ? root.strings.t("sites.direct")
+      : (r.node !== "" ? root.strings.t("sites.via").arg(r.node) : root.strings.t("sites.viaTunnel")))
+    return r.why === "rule" ? root.strings.t("sites.byRule").arg(way) : way
+  }
+
+  function siteDetail(r) {
+    if (r === null) return root.strings.t("sites.unchecked")
+    if (r.ok) return r.ms !== null
+      ? root.strings.t("sites.okLine").arg(siteWay(r)).arg(Commons.I18n.formatNumber(r.ms)) : siteWay(r)
+    var why = root.strings.t("sites.err." + r.error, root.strings.t("sites.err.other"))
+    if (why.indexOf("%1") >= 0) why = why.arg(String(r.status))
+    return root.strings.t("sites.failLine").arg(why).arg(siteWay(r))
   }
 
   // ---- the xray core -------------------------------------------------------------

@@ -29,22 +29,26 @@ from the documentation ranges; no real server is shown.*
 - **Nodes by delay**, with search and an *Auto* mode that picks the fastest.
 - **Per-site rules**: from the Sites page, "always direct" or "always via
   the tunnel" for a host you see there.
+- **Checked sites** (none by default): add a link, and the panel says whether
+  the site opens and which way it goes — through which node, direct by a
+  preset or a rule, or direct because the tunnel is off — with a
+  notification when it stops opening and when it is back.
 - **Fallback node** (off by default): if the node you picked stops
   answering, traffic moves to the fallback in about 30 s and comes back by
   itself.
 - **Russia preset** (off by default): Russian sites (`category-ru`,
   `geoip:ru`, the `.ru`, `.su` and `xn--p1ai` zones) go direct.
-- **Notifications** when protection drops, a node goes down or the fallback
-  takes over.
+- **Notifications** when protection drops, a node goes down, the fallback
+  takes over, or a checked site stops opening.
 - **Core updates** from the panel: official XTLS releases only, checked
   against SHA-256 sums the package pins.
 - English and Russian, following Omarchy's language setting.
 
 ## Screenshots
 
-| Sites and rules | Settings |
+| Sites, checks and rules | Settings |
 |---|---|
-| ![Sites: hosts, connection counts, tunnel or direct, the rules in force](docs/screenshots/sites.png) | ![Settings: notifications, the Russia preset and the fallback node](docs/screenshots/settings.png) |
+| ![Sites: the checked sites and their way, the rules in force, hosts with connection counts, tunnel or direct](docs/screenshots/sites.png) | ![Settings: notifications, site notifications, the Russia preset and the fallback node](docs/screenshots/settings.png) |
 | **Subscriptions** | **Core** |
 | ![Subscriptions: traffic left, expiry, skipped links](docs/screenshots/subscriptions.png) | ![Core: installed, latest and rollback versions](docs/screenshots/core.png) |
 | **Switched off** | **First run** |
@@ -211,11 +215,72 @@ encryption, xray JSON), this one runs them natively.
   in plain DNS. If the connection has a public resolver set by hand (say
   9.9.9.9), that resolver sees those names.
 
+## Checked sites
+
+A short list of sites you want to keep an eye on, say `ya.ru` and YouTube:
+does each one open, and which way does it go.
+
+```
+xray-omarchy site add Internet https://ya.ru/
+xray-omarchy site add YouTube https://www.youtube.com/generate_204
+xray-omarchy site check            # or --json
+xray-omarchy site list | rm NAME | notify on|off
+```
+
+The panel does the same from the Sites page ("Add site…", × to stop
+checking). On the main screen, once there is a site, one line under
+protection says "Sites: 2 of 2 open" or "Not opening: YouTube"; a click
+shows each site with its way: `via Helsinki 1 · 164 ms`, `direct · 136 ms`,
+`direct by rule · 80 ms`, `direct (tunnel off) · 120 ms`.
+
+- **How it checks.** One HTTPS GET per site (IPv4, 10 s for all of them),
+  sent the way any program on the machine sends it, so it takes the real
+  path. Only https links, without a user or password in them, ten at most.
+- **What it counts as open.** Any answer below 400 (a redirect counts as an
+  answer and is not followed); 400 or more reads "answered 503". A site that
+  answers 403 or 429 to requests that do not come from a full browser (some
+  bot protections do) is listed as not opening, though it opens in your
+  browser.
+- **What the site sees.** An ordinary request with the User-Agent, Accept
+  and Accept-Language of Firefox for Linux; the program's name is not sent, so a site
+  checked direct (say, a Russian one with the Russia preset on, which then
+  sees your real address) is not told that a VPN client runs here. It is not
+  a perfect disguise: the TLS handshake is Python's, not Firefox's.
+- **How it knows the way.** It finds its own connection in the core's
+  access log by the local port and reads which outbound took it: a node,
+  direct or blocked; then whether a site rule, a local network or a direct
+  list (the Russia preset) decided it. If the log does not have it (the name
+  did not resolve, say), the way is worked out from the rules; geosite and
+  geoip lists are not readable outside the core, so such a guess says
+  "tunnel". With the tunnel off it says "direct (tunnel off)".
+- **When.** While the tunnel runs, the notification service checks once a
+  minute and tells the desktop after three failures in a row ("Site
+  unreachable: YouTube (via Helsinki 1)", the way that failing check took;
+  "way unknown" when it took none, say the name did not resolve) and once it
+  opens again — once per change. Three in a row, 10 s each, so one slow
+  minute on a slow node is not an alarm. The switch is Settings > Site
+  notifications (and Notifications above it). With the tunnel off nothing runs in the background; the panel
+  checks when it is opened.
+- **What it costs.** Each check is one TLS handshake and the start of one
+  answer: about 8.5 KB inside the tunnel and 11 KB on the wire to the node
+  (measured on a test machine for `generate_204`; a site that sends a big
+  page may push more of it before the connection closes). The background
+  check runs once a minute and only while the tunnel is on: about 16 MB a
+  day per site, so about 30 MB with two sites and 160 MB with ten — worth
+  knowing on a subscription with a traffic cap (a site that goes direct
+  does not use the subscription's traffic). The checks' own connections are
+  left out of Sites > Recent and its connection counts; the traffic figures
+  (today ↓ ↑) count them, since the core counts bytes per node, not per
+  connection.
+- **Where.** The list is `check_sites` in `~/.config/xray-omarchy/settings.json`;
+  the last result is in `~/.local/state/xray-omarchy/sites.json`.
+
 ## Settings
 
 `~/.config/xray-omarchy/settings.json`, all optional (an empty file means:
 detect): `lan_domains`, `direct_geo` (`geosite`, `geoip`, `domains` that go
-direct; empty by default), `local_nets`, `lan_dns`, `notify`. The network
+direct; empty by default), `local_nets`, `lan_dns`, `notify`, `check_sites`
+and `site_notify` (see Checked sites). The network
 interface, the NetworkManager connection, the network's DNS and DHCP server
 are detected. `local_nets` may hold only private (10/8, 172.16/12,
 192.168/16), CGNAT (100.64/10), link-local (169.254/16, fe80::/10) and ULA
@@ -240,7 +305,8 @@ when there are any); the node list (Auto on top, the nodes that answer by
 delay, the dead folded; search past ten nodes; the order holds while the
 panel is open). The menu opens **Subscriptions**, **Sites**, **Settings** and
 **Core** as second pages and runs a subscription update. While traffic goes
-through the fallback node the main screen says so in one line.
+through the fallback node the main screen says so in one line; once you
+check sites, one more line says how many open.
 
 Keys: `↑`/`↓` move over the nodes, `Enter` picks the one under the cursor or
 opens the fold, `/` or `f` searches, `s` subscriptions, `c` sites, `m` the
@@ -249,7 +315,7 @@ page, `Esc` closes. Nothing on the keyboard turns the tunnel off or switches
 the subscription.
 
 IPC (`omarchy-shell grigabyte.xray-omarchy <verb>`): `open`, `close`,
-`toggle`, `refresh`, `showPage main|subs|sites|settings|core|addsub|menu`,
+`toggle`, `refresh`, `showPage main|subs|sites|settings|core|addsub|addsite|menu`,
 `filter <text>`, `select <id|auto>`, `status`.
 
 ## Development

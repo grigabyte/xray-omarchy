@@ -112,6 +112,26 @@ the fold closed and the node order taken afresh.
   yellow — a notice, not an alarm: the tunnel works and comes back by itself.
   The bar's tooltip says "on the fallback node" too. Absent otherwise, so the
   main screen keeps its height (312 px with two nodes).
+- **Checked sites.** One line under protection, only once the user has added
+  a site: a chevron and "Sites: 2 of 2 open" in the dim colour, or
+  "Not opening: YouTube" in the theme's yellow (a notice like the fallback
+  line: the tunnel itself is fine, and protection keeps the red). The
+  chevron (down folded, up unfolded) sits on the left, in the shield's
+  column, like the node list's "Unreachable: N" fold: one place for "this
+  opens" across the panel. A click on
+  the line unfolds one row per site in place, folded again on every open:
+  the name, and in the dim caption size which way it went and how fast —
+  "via 🇫🇮 Helsinki 1 · 164 ms", "direct · 136 ms" (a preset or direct list),
+  "direct by rule · 80 ms" (rules.json), "direct (tunnel off) · 120 ms". A
+  site that does not open has its name dimmed and says why first: "no
+  answer in 10 s · via Helsinki 1". With no sites the line is absent and the
+  main screen is exactly as before (pixel for pixel on the stand). Rejected:
+  a "SITES" block always open (a header and a row per site on every open,
+  for something that is fine almost always), the sites only on the Sites page (the owner wanted
+  them at a glance, as the Servers panel had them), a red line for a
+  site down (red stays for protection), and a globe glyph on the left with
+  the chevron on the right (the first build: the fold opened from the other
+  side than the node list's).
 - **Subscriptions**: active marked (dot, fill, the word ACTIVE), node count,
   age of the last fetch, quota (`total=0` no cap, `expire=0` no end date),
   skipped links, and why the last update of that subscription failed. Facts
@@ -131,8 +151,19 @@ the fold closed and the node order taken afresh.
   rule of its own). One menu per page, placed inside the card: the rows are a
   ListView that gets a new array every poll. Above the hosts, only when there
   are any, the rules: host, "always direct" / "always via tunnel", and a ×
-  that removes it.
-- **Settings**: "Notifications" with a switch; "Russia: send Russian sites
+  that removes it. Above both, the checked sites: "CHECKED SITES" with an
+  "Add site…" button (off at ten), then per site its name, and in the caption
+  size its host and the last result in the main screen's words, with a ×
+  that stops checking it (no confirmation: nothing changes on the network).
+  With none, one line: "Checks if the site opens and which way it goes…".
+  "Add site…" opens a form page like the subscription one: an https link and
+  an optional name (the link's host when empty); Enter adds, Esc goes back
+  to the sites page, and the new site is checked at once.
+- **Settings**: "Notifications" with a switch; "Site notifications" with its
+  own switch, on by default, for a checked site that stops opening and comes
+  back (shown only once there is a site to check; with "Notifications" off it says these are silent too, and its
+  switch dims; one master switch for everything the watcher says, rejected
+  as the only one: a flaky site should not silence protection alerts); "Russia: send Russian sites
   direct" with a switch, off by default (everything goes through the tunnel
   until it is turned on; shown only when the CLI reports `presets`) — with the
   tunnel running it asks "Restart the core…?" first and runs the preset with
@@ -240,6 +271,20 @@ the numbers). What keeps it fast:
 - `xray-omarchy fallback set <id> | on | off --json` from the settings page;
   `--apply` only after the restart confirmation.
 - `xray-omarchy notify on|off --json` from the settings switch.
+- `xray-omarchy site notify on|off --json` from the site notifications switch.
+- `xray-omarchy site check --json`: only while the panel is open, when the
+  last check `status` reports is stale (none, older than 90 s by the CLI's
+  clock, made with the tunnel in the other state, or a site without a
+  result), at most every 30 s and never while the tunnel switches; and once
+  after a site is added. Its own process, never inside the poll: it sends
+  one HTTPS request per site and takes up to 10 s (a moment more to read the
+  way from the core's log). The CLI keeps the result
+  for `status`; the panel polls again when it ends. While the tunnel runs
+  the watcher checks once a minute anyway, so the panel rarely needs to.
+- `xray-omarchy site add --json -- <name> <url>` from the form only, the
+  link checked by `Model.siteUrl` (https, one line of printable ASCII, no
+  user or password) and the name by `Model.siteName`; `xray-omarchy site rm
+  --json -- <name>` from a row's ×, a name the CLI reported.
 - `xray-omarchy preset russia on|off --json` from the settings switch, with
   `--apply` only after the restart confirmation. The name must be one
   `Model.validPreset` knows.
@@ -275,7 +320,68 @@ the numbers). What keeps it fast:
 - Never through a shell (the launcher above is the one command line, and it
   carries only the quoted path). No key, no IPC verb and no bar click turns the tunnel
   off, switches the subscription, changes the fallback, the notifications,
-  a preset or a rule, or updates the core. IPC `showPage` only shows pages (and the menu).
+  a preset, a rule or the checked sites, or updates the core. IPC `showPage` only shows pages (and the menu).
+
+## Checking sites
+
+What the owner had as two rows of the Servers panel ("Internet": ya.ru,
+"YouTube (VPN)": generate_204), made general: any https link, with the way
+it went.
+
+- The list is `check_sites` in `settings.json` ([{name, url}], ten at most),
+  empty by default: nothing is checked without being asked. Names follow the
+  subscription rule; links are https only, a domain or an IPv4 address, no
+  user or password (nothing secret goes into a check), 2000 characters.
+- A check is one HTTPS GET, IPv4, sent as any program here sends it, so it
+  takes the system's path: through the TUN while the tunnel runs, direct
+  otherwise. 10 s for all sites together (they run in parallel; a name lookup
+  has no timeout of its own, so the deadline is shared; 6 s at first, which
+  a slow node missed now and then). A redirect is not
+  followed: it is an answer, the site opens. ok: an answer below 400; 4xx
+  and 5xx say "answered 503", so a site that answers 403 or 429 to anything
+  but a full browser is listed as not opening. Failures are codes (`timeout`, `dns_failed`,
+  `refused`, `reset`, `tls_cert`, `tls_failed`, `unreachable`, `bad_answer`,
+  `http_status`, `other`); the panel words them.
+- The request looks like an ordinary browser's: Firefox for Linux's
+  User-Agent, Accept and Accept-Language, no program name. A site checked
+  direct (a Russian one under the Russia preset) sees the user's real
+  address, and the first build's "xray-omarchy/0.7.0" told it a VPN client
+  runs there. The TLS handshake is still Python's; that is not hidden.
+- The checks' own connections stay out of `recent`: each check notes its
+  local port, address, port and start time in `site-probes.json` next to the
+  core's log as the connection is made, before the core can log it, so they
+  are left out while the check still runs too (under a lock: the watcher, the
+  panel and the parallel checks all write it), and
+  `recent` skips the lines that match within the check's time. Notes older
+  than the log's first line are dropped. The traffic figures still count the
+  checks: the core counts bytes per outbound.
+- The way is read only from the log lines written after the check started
+  (the log's size is noted first), so an older line of a reused port is
+  never taken for it. The local port is bound before connecting, so a
+  connection that never completes can still be found.
+- The way it went is read back from the core's access log by the request's
+  own local port (the line says `from tcp:172.19.0.1:<port> … [tun -> x-…]`):
+  the node it went through, `direct` or `block`. Then why: a site rule
+  (rules.json) covers it, a local address or LAN name, or a direct list
+  (a preset). A check the log does not hold (the name did not resolve) is
+  worked out from the rules and marked `source: rules`; geosite and geoip
+  lists cannot be read without the core, so such a guess says "tunnel".
+  With the tunnel off: "direct (tunnel off)".
+- `status` carries the list and the last result (kept in
+  `~/.local/state/xray-omarchy/sites.json`) without touching the network.
+- The watcher checks once a minute, in a thread of its own so a slow site
+  never holds up the protection checks. A site is "unreachable" after three
+  failed checks in a row (two at first: one slow minute on a slow node made
+  a false alarm) and "back" after one good one; one notification
+  per change ("Site unreachable: YouTube (via Helsinki 1)"). The way named
+  is the failing check's own: from the log, or from a rule, a local address
+  or a direct zone; a failure nothing places (the name did not resolve, the
+  default tunnel guessed) says "way unknown". (The first build named the
+  last good check's way, which could be a path the failing request never
+  took.) The
+  watcher runs with the tunnel (PartOf), so with the tunnel off nothing is
+  checked in the background and nothing is notified; the panel checks on
+  open instead.
 
 ## Text
 

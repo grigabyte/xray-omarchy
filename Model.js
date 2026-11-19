@@ -11,7 +11,7 @@
 // (tests/check_versions.py keeps them equal). After `omarchy plugin update`
 // the shell may keep running the code it loaded before: the manifest on disk
 // is newer than this, and the panel asks for a shell restart.
-var PANEL_VERSION = "0.6.3"
+var PANEL_VERSION = "0.7.0"
 
 var NODE_ID_RE = /^[0-9a-f]{10}$/
 var COUNTRY_RE = /^[A-Z]{2}$/
@@ -36,6 +36,7 @@ var MAX_NODES = 3000
 var MAX_TEXT = 200
 var MAX_ERROR_TEXT = 400
 var MAX_RULES = 100
+var MAX_SITES = 10
 
 // A host for `xray-omarchy rule`: lowercase, a dotted domain or an IPv4 address, as
 // the CLI accepts it. It reaches argv after "--" and only when it came out of
@@ -347,6 +348,102 @@ function componentsOutdated(setup, pluginVersion) {
   return !!setup && setup.known === true && versionOlder(setup.version, pluginVersion)
 }
 
+// ---- checked sites -----------------------------------------------------------
+//
+// `status.sites`: {items: [{name, host, result}], checked, tunnel, notify}.
+// The CLI checks them (the watcher once a minute while the tunnel runs, or
+// `xray-omarchy site check` from the panel); the panel only shows the last result.
+
+// A link for `xray-omarchy site add`: https only, one line of printable ASCII,
+// no user or password, up to 2000 characters. "" when it is not one. The CLI
+// checks it again.
+var SITE_URL_RE = /^https:\/\/[^\s\/?#@]+(?:[\/?#][\x21-\x7e]*)?$/i
+
+function siteUrl(text) {
+  var url = String(text || "").trim()
+  if (url.length > 2000 || CONTROL_RE.test(url) || !SITE_URL_RE.test(url)) return ""
+  return url
+}
+
+// The name for a new site: what was typed, or the link's host. The CLI's rule
+// for names, as for subscriptions.
+function siteName(text, url) {
+  return subscriptionName(text, url)
+}
+
+var SITE_VIAS = ["tunnel", "direct", "block"]
+var SITE_WHYS = ["rule", "local", "geo", "tunnel_off"]
+
+function normalizeSiteResult(raw) {
+  if (!raw || typeof raw !== "object" || typeof raw.ok !== "boolean") return null
+  var ms = raw.ms === null || raw.ms === undefined ? null : Number(raw.ms)
+  if (ms !== null && (!isFinite(ms) || ms < 0)) ms = null
+  var status = Math.floor(num(raw.status))
+  return {
+    ok: raw.ok,
+    status: status >= 100 && status <= 599 ? status : 0,
+    ms: ms === null ? null : Math.round(ms),
+    error: raw.ok ? "" : (code(raw.error) || "other"),
+    via: SITE_VIAS.indexOf(raw.via) >= 0 ? raw.via : "tunnel",
+    node: clip(raw.node, MAX_TEXT),
+    why: SITE_WHYS.indexOf(raw.why) >= 0 ? raw.why : "",
+    fromLog: raw.source === "log"
+  }
+}
+
+function normalizeSites(raw) {
+  var src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null
+  if (src === null) return { known: false, items: [], checked: 0, tunnel: null, notify: false }
+  var list = Array.isArray(src.items) ? src.items : []
+  var items = []
+  for (var i = 0; i < list.length && items.length < MAX_SITES; i++) {
+    var it = list[i]
+    if (!it || typeof it !== "object" || typeof it.name !== "string" || it.name === "") continue
+    items.push({ name: clip(it.name, 40), host: clip(it.host, MAX_TEXT), result: normalizeSiteResult(it.result) })
+  }
+  return {
+    known: true,
+    items: items,
+    checked: num(src.checked),
+    tunnel: typeof src.tunnel === "boolean" ? src.tunnel : null,
+    notify: src.notify === true
+  }
+}
+
+// A name the CLI reported, for `xray-omarchy site rm`.
+function validSiteName(name, sites) {
+  if (typeof name !== "string" || name === "" || !sites) return false
+  for (var i = 0; i < sites.items.length; i++) if (sites.items[i].name === name) return true
+  return false
+}
+
+// The main screen's one line: how many open, which do not, and whether any is
+// still unchecked.
+function siteSummary(sites) {
+  var out = { total: 0, ok: 0, failed: [], unchecked: 0 }
+  if (!sites) return out
+  out.total = sites.items.length
+  for (var i = 0; i < sites.items.length; i++) {
+    var r = sites.items[i].result
+    if (r === null) out.unchecked++
+    else if (r.ok) out.ok++
+    else out.failed.push(sites.items[i].name)
+  }
+  return out
+}
+
+// The last check says nothing true any more: never made, older than
+// `maxAge` seconds by the CLI's clock, made with the tunnel in the other
+// state, or a site added after it. The panel then asks for a fresh one.
+function sitesStale(status, maxAge) {
+  if (!status || !status.sites || status.sites.items.length === 0) return false
+  var s = status.sites
+  if (s.checked === 0 || s.tunnel === null || s.tunnel !== status.running) return true
+  if (num(status.time) - s.checked > (maxAge || 90)) return true
+  for (var i = 0; i < s.items.length; i++) if (s.items[i].result === null) return true
+  return false
+}
+
 // Direct presets from `status.presets` ({russia: bool}). A CLI without the
 // field (older package) has none: the switch is not shown.
 var PRESET_NAMES = ["russia"]
@@ -432,6 +529,7 @@ function parseStatus(text) {
     fallback: normalizeFallback(raw.fallback),
     notify: raw.notify === true,
     notifyKnown: typeof raw.notify === "boolean",
+    sites: normalizeSites(raw.sites),
     rules: normalizeRules(raw.rules),
     presets: normalizePresets(raw.presets),
     setup: normalizeSetup(raw.setup),

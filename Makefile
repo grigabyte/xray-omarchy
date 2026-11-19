@@ -5,6 +5,7 @@ QML_FILES := Panel.qml Service.qml $(wildcard components/*.qml)
 
 test:
 	node tests/test_model.js
+	python3 -I -B tests/test_sites.py
 	bash tests/test_panel_source.sh
 	python3 -I -B -c 'import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' backend/xray-omarchy backend/xray-omarchy-helper
 	bash -n backend/install.sh backend/uninstall.sh backend/killswitch-test backend/update-sums.sh backend/pin-core.sh

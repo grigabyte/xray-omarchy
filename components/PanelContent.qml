@@ -16,7 +16,8 @@ import "../Model.js" as Model
 // the node list. Subscriptions, sites, settings (notifications and the
 // fallback node) and the core are second pages behind the menu, with a back
 // arrow, built only while they are shown. The main screen gains one line
-// only while traffic goes through the fallback node.
+// only while traffic goes through the fallback node, and one line of checked
+// sites once there are any (its rows unfold in place).
 PanelKeyCatcher {
   id: root
 
@@ -34,8 +35,10 @@ PanelKeyCatcher {
   signal dismissRequested()
   signal switchPanelRequested(int direction)
 
-  // "main", "subs", "sites", "settings", "core" or "addsub".
+  // "main", "subs", "sites", "settings", "core", "addsub" or "addsite".
   property string page: "main"
+  // The checked sites' rows under their line on the main screen.
+  property bool sitesExpanded: false
   // The node-list cursor holds a key (see NodeList), "" with no cursor.
   property string cursorKey: ""
   property int subCursor: -1
@@ -79,7 +82,7 @@ PanelKeyCatcher {
     font.pixelSize: Style.font.title
     wrapMode: Text.WordWrap
   }
-  blocked: nodeList.filterFocused || confirmKind !== "" || moreMenu.menuOpen || addSubForm.typing
+  blocked: nodeList.filterFocused || confirmKind !== "" || moreMenu.menuOpen || addSubForm.typing || addSiteForm.typing
 
   function bytes(n) { return Model.formatBytes(n, Commons.I18n.formatNumber) }
 
@@ -124,7 +127,8 @@ PanelKeyCatcher {
   // select, fallback, rule, core); a code this catalog does not know reads as
   // that verb's ".other" sentence, never as the code itself. The core's own
   // words, when the CLI gave any, follow.
-  readonly property var codeFamilies: ["on.", "off.", "select.", "fallback.", "rule.", "core.", "subadd.", "install."]
+  readonly property var codeFamilies: ["on.", "off.", "select.", "fallback.", "rule.", "core.", "subadd.", "install.",
+    "siteadd.", "siterm."]
 
   function noticeSentence() {
     var key = service.noticeKey
@@ -156,6 +160,7 @@ PanelKeyCatcher {
     page = "main"
     cursorKey = ""
     subCursor = -1
+    sitesExpanded = false
     if (confirmKind === "fallback") service.cancelFallbackApply()
     confirmKind = ""
     confirmArg = ""
@@ -168,7 +173,7 @@ PanelKeyCatcher {
   onPanelOpenChanged: if (panelOpen) resetForOpen()
   Component.onCompleted: resetForOpen()
 
-  readonly property var pages: ["main", "subs", "sites", "settings", "core", "addsub"]
+  readonly property var pages: ["main", "subs", "sites", "settings", "core", "addsub", "addsite"]
 
   function showPage(name) {
     if (name === "menu") {
@@ -182,6 +187,7 @@ PanelKeyCatcher {
     subCursor = -1
     panelFlick.contentY = 0
     if (name === "addsub") addSubForm.start()
+    else if (name === "addsite") addSiteForm.start()
     else Qt.callLater(function() { root.forceActiveFocus() })
     return true
   }
@@ -263,6 +269,8 @@ PanelKeyCatcher {
     // Back to the main screen: the nodes of the new subscription, or the card
     // with the notice of why it did not download.
     function onSubscriptionAdded(name) { if (root.page === "addsub") root.showPage("main") }
+    // A site added: back to the sites page, where its first check shows up.
+    function onSiteAdded(name) { if (root.page === "addsite") root.showPage("sites") }
   }
 
   // `core status` runs only while the core page is on screen.
@@ -395,7 +403,7 @@ PanelKeyCatcher {
           anchors.verticalCenter: parent.verticalCenter
           text: root.strings.t(root.page === "subs" ? "subs.header"
             : (root.page === "settings" ? "settings.header" : (root.page === "core" ? "corePage.header"
-            : (root.page === "addsub" ? "addSub.header" : "recent.header"))))
+            : (root.page === "addsub" ? "addSub.header" : (root.page === "addsite" ? "addSite.header" : "recent.header")))))
           foreground: root.foreground
           fontFamily: root.fontFamily
         }
@@ -752,6 +760,102 @@ PanelKeyCatcher {
             elide: Text.ElideRight
           }
         }
+
+        // Checked sites: one line under protection — "Sites: 2 of 2 open",
+        // or which ones do not open, in the theme's yellow (a notice: the
+        // tunnel itself is fine). A click unfolds one row per site in place:
+        // its name and which way it went. The chevron sits in the icon column
+        // on the left, as on the node list's "Unreachable: N" fold. Absent
+        // with no sites, so a new user's main screen is as it was; every open
+        // starts folded.
+        Item {
+          id: sitesLine
+          visible: sitesLine.sites !== null && sitesLine.sites.items.length > 0
+          width: guard.width
+          implicitHeight: sitesText.implicitHeight
+
+          readonly property var sites: root.status ? root.status.sites : null
+          readonly property var summary: Model.siteSummary(sites)
+          readonly property bool trouble: summary.failed.length > 0
+          readonly property color tone: trouble ? root.slowColor : root.dim
+
+          // The same column and size as the shield above.
+          Item {
+            id: sitesChevron
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.font.bodySmall
+            height: Style.font.bodySmall
+
+            ActionIcon {
+              anchors.centerIn: parent
+              name: root.sitesExpanded ? "chevron-up" : "chevron-down"
+              iconSize: Style.font.caption
+              color: sitesLine.tone
+            }
+          }
+          Text {
+            id: sitesText
+            anchors.left: sitesChevron.right
+            anchors.leftMargin: Style.space(6)
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: sitesLine.trouble ? root.strings.t("sites.notOpening").arg(sitesLine.summary.failed.join(", "))
+              : (sitesLine.summary.unchecked === sitesLine.summary.total ? root.strings.t("sites.checking")
+              : root.strings.t("sites.summary").arg(Commons.I18n.formatNumber(sitesLine.summary.ok))
+                  .arg(Commons.I18n.formatNumber(sitesLine.summary.total)))
+            color: sitesLine.tone
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.sitesExpanded = !root.sitesExpanded
+          }
+        }
+
+        Repeater {
+          model: root.sitesExpanded && sitesLine.visible ? sitesLine.sites.items : []
+
+          delegate: Item {
+            id: siteRow
+            required property var modelData
+            readonly property bool opens: modelData.result !== null && modelData.result.ok
+            x: Style.font.bodySmall + Style.space(6)
+            width: guard.width - x
+            implicitHeight: Math.max(siteName.implicitHeight, siteWay.implicitHeight)
+
+            Text {
+              id: siteName
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              width: Math.min(implicitWidth, parent.width * 0.4)
+              textFormat: Text.PlainText
+              text: siteRow.modelData.name
+              color: siteRow.opens ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+            Text {
+              id: siteWay
+              anchors.left: siteName.right
+              anchors.leftMargin: Style.space(10)
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              horizontalAlignment: Text.AlignRight
+              textFormat: Text.PlainText
+              text: root.service.siteDetail(siteRow.modelData.result)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+          }
+        }
       }
 
       PanelSeparator {
@@ -807,6 +911,7 @@ PanelKeyCatcher {
           textColor: root.foreground
           panelFontFamily: root.fontFamily
           menuHost: root
+          onAddSiteRequested: root.showPage("addsite")
         }
       }
 
@@ -849,6 +954,18 @@ PanelKeyCatcher {
         textColor: root.foreground
         panelFontFamily: root.fontFamily
         onCancelRequested: root.showPage(root.status !== null && root.status.subscriptions.length > 0 ? "subs" : "main")
+      }
+
+      // A new site to check; kept built for the same reason.
+      AddSitePage {
+        id: addSiteForm
+        visible: root.page === "addsite"
+        width: parent.width
+        service: root.service
+        strings: root.strings
+        textColor: root.foreground
+        panelFontFamily: root.fontFamily
+        onCancelRequested: root.showPage("sites")
       }
 
       Loader {

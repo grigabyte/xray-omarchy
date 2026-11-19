@@ -15,6 +15,10 @@ import "../Model.js" as Model
 // A host a rule decides is marked. The rules themselves are listed above the
 // hosts, each with a button that removes it; the block is absent when there
 // are none. Hosts reach the CLI only as the CLI reported them.
+//
+// Above everything, the checked sites: does each open, and which way it
+// went (the CLI checks them; the panel shows the last result). "Add site…"
+// opens the form; a × removes one. With none, one line says what it is for.
 Column {
   id: root
 
@@ -29,6 +33,10 @@ Column {
   readonly property var status: service.status
   readonly property var recent: status ? status.recent : []
   readonly property var rules: status ? Model.ruleRows(status.rules) : []
+  readonly property var sites: status ? status.sites : null
+  readonly property var siteItems: sites ? sites.items : []
+
+  signal addSiteRequested()
 
   function ruleText(side) { return side === "direct" ? root.strings.t("rules.direct") : root.strings.t("rules.tunnel") }
 
@@ -58,11 +66,133 @@ Column {
   function count(n) { return Commons.I18n.formatNumber(n) }
 
   function scrollBy(dy) {
-    var step = Style.space(48) * dy
+    var step = (list.stride > 0 ? list.stride : Style.space(48)) * dy
     list.contentY = Math.max(0, Math.min(list.contentHeight - list.height, list.contentY + step))
   }
 
   spacing: Style.space(6)
+
+  // ---- checked sites: one row each, a × removes it -------------------------
+  Column {
+    id: checksBlock
+    visible: root.sites !== null && root.sites.known
+    width: parent.width
+    spacing: Style.space(4)
+
+    Item {
+      width: parent.width
+      implicitHeight: Math.max(checksHeader.implicitHeight, addSiteButton.implicitHeight)
+
+      Text {
+        id: checksHeader
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        textFormat: Text.PlainText
+        text: root.strings.t("sites.header")
+        color: root.dim
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        font.letterSpacing: 1.2
+      }
+
+      Button {
+        id: addSiteButton
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        enabled: !root.service.addingSite && root.siteItems.length < Model.MAX_SITES
+        opacity: enabled ? 1.0 : 0.45
+        text: root.strings.t("sites.add")
+        foreground: root.textColor
+        bordered: true
+        fontFamily: root.panelFontFamily
+        fontSize: Style.font.caption
+        verticalPadding: Style.space(3)
+        horizontalPadding: Style.space(8)
+        onClicked: root.addSiteRequested()
+      }
+    }
+
+    Text {
+      visible: root.siteItems.length === 0
+      width: parent.width
+      textFormat: Text.PlainText
+      text: root.strings.t("sites.hint")
+      color: root.dim
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+
+    Repeater {
+      model: root.siteItems
+
+      delegate: Item {
+        id: checkRow
+        required property var modelData
+        readonly property bool opens: modelData.result !== null && modelData.result.ok
+        width: checksBlock.width
+        implicitHeight: checkName.implicitHeight + checkDetail.implicitHeight + Style.space(2)
+
+        Text {
+          id: checkName
+          anchors.left: parent.left
+          anchors.right: checkRemove.left
+          anchors.rightMargin: Style.space(8)
+          anchors.top: parent.top
+          textFormat: Text.PlainText
+          text: checkRow.modelData.name
+          color: checkRow.opens ? root.textColor : root.dim
+          font.family: root.panelFontFamily
+          font.pixelSize: Style.font.bodySmall
+          elide: Text.ElideRight
+        }
+
+        Text {
+          id: checkDetail
+          anchors.left: parent.left
+          anchors.right: checkRemove.left
+          anchors.rightMargin: Style.space(8)
+          anchors.top: checkName.bottom
+          anchors.topMargin: Style.space(2)
+          textFormat: Text.PlainText
+          text: checkRow.modelData.host + " · " + root.service.siteDetail(checkRow.modelData.result)
+          color: root.dim
+          font.family: root.panelFontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideMiddle
+        }
+
+        PanelActionButton {
+          id: checkRemove
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          size: Style.space(22)
+          enabled: root.service.pendingSite === "" && !root.service.addingSite
+          tooltipText: root.strings.t("sites.remove")
+          foreground: root.textColor
+          fontFamily: root.panelFontFamily
+          onClicked: root.service.removeSite(checkRow.modelData.name)
+
+          ActionIcon {
+            anchors.centerIn: parent
+            name: "close"
+            iconSize: Style.font.caption
+            color: root.textColor
+          }
+        }
+      }
+    }
+
+    Item { width: 1; height: Style.space(4) }
+
+    PanelSeparator {
+      width: parent.width
+      foreground: root.textColor
+    }
+
+    Item { width: 1; height: Style.space(2) }
+  }
 
   // ---- the rules: one row each, with a button that removes it -------------
   Column {
@@ -163,9 +293,18 @@ Column {
     id: list
     width: parent.width
     visible: root.recent.length > 0
-    // The rules block takes its room out of the list's, so the page as a
-    // whole stays inside the card.
-    height: Math.min(contentHeight, Math.max(Style.space(160), root.maxHeight - (rulesBlock.visible ? rulesBlock.height + root.spacing : 0)))
+    // The checks and the rules take their room out of the list's, so the
+    // page as a whole stays inside the card.
+    readonly property real room: Math.max(Style.space(160), root.maxHeight
+      - (rulesBlock.visible ? rulesBlock.height + root.spacing : 0)
+      - (checksBlock.visible ? checksBlock.height + root.spacing : 0))
+    // One row and its gap (the rows are all one height). A list taller than
+    // its room shows whole rows only, so no row is ever cut in half at the
+    // bottom; the scroll bar says there is more, and scrolled to either end
+    // the rows line up again (the content is a whole number of rows too).
+    readonly property real stride: count > 0 ? (contentHeight + spacing) / count : 0
+    height: contentHeight <= room || stride <= 0 ? Math.min(contentHeight, room)
+      : Math.max(stride - spacing, Math.floor((room + spacing) / stride) * stride - spacing)
     clip: true
     spacing: Style.space(8)
     reuseItems: true

@@ -2,7 +2,7 @@
 #   cp -r backend /tmp/x && cp LICENSE /tmp/x/ && cd /tmp/x && makepkg -si
 # Never inside the plugin folder: every write there reloads the shell.
 pkgname=xray-omarchy
-pkgver=0.6.3
+pkgver=0.7.0
 pkgrel=1
 pkgdesc="Xray tunnel for Omarchy: TUN, killswitch, split DNS and subscriptions behind one CLI (backend of the bar plugin)"
 # x86_64 only: the core sums are pinned for Xray-linux-64.zip (core-sums.json).
@@ -26,7 +26,7 @@ source=(xray-omarchy
         xray-omarchy-killswitch.service
         core-sums.json
         LICENSE)
-sha256sums=('7b72065a3a819807fc31cfbe9066db6f5ba702a02539921887583c7a5e3fc25d'
+sha256sums=('e5306c57ac4e7d21f09b864d4ff4f0dc4f72498828c7f90577cf4bb78c7e443d'
             '8866ba18e054363354d964289713a29b4291443da2b3cfe246aca29786f0e4af'
             '2c74e1009cbad77e9efc4699d42b5869deb2748fe2a8f3602cf2adb8de4766bf'
             '2995d2ccd91955182270229706d480814735e59d1b04e6b36ce3e5b1c1bf3979'

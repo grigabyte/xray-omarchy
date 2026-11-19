@@ -179,6 +179,9 @@ say "==> Enabling the timers and the notifications"
 if systemctl --user daemon-reload 2>/dev/null; then
   systemctl --user enable xray-omarchy-update.timer xray-omarchy-trim.timer xray-omarchy-watch.service
   systemctl --user start xray-omarchy-update.timer xray-omarchy-trim.timer || true
+  # A watcher started before this update still runs the old code: started
+  # again (only if it runs) so the new checks and notifications take effect.
+  systemctl --user try-restart xray-omarchy-watch.service || true
 else
   echo "No systemd user session here: run later, in your desktop session:" >&2
   echo "  systemctl --user enable --now xray-omarchy-update.timer xray-omarchy-trim.timer xray-omarchy-watch.service" >&2

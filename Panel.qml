@@ -73,7 +73,7 @@ Panel {
     function showPage(value: string): string {
       var content = panel.ensureContent()
       if (!content) return "not built"
-      return content.showPage(String(value || "")) ? "ok" : "expected main, subs, sites, settings, core, addsub or menu"
+      return content.showPage(String(value || "")) ? "ok" : "expected main, subs, sites, settings, core, addsub, addsite or menu"
     }
     // Types into the node search (shown past ten nodes).
     function filter(value: string): string {
@@ -103,6 +103,8 @@ Panel {
         restartNeeded: vpn.restartNeeded,
         pollError: vpn.pollError,
         page: c ? c.page : "",
+        // The checked sites as the main screen counts them.
+        sites: s ? Model.siteSummary(s.sites) : null,
         // The list as it is on screen, for checking that it stays put.
         order: c ? c.listKeys().slice(0, 20) : [],
         height: c ? Math.round(c.implicitHeight) : 0
