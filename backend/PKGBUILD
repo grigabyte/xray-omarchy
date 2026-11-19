@@ -1,0 +1,63 @@
+# Built by install.sh (from a copy of this directory) or by hand:
+#   cp -r backend /tmp/x && cp LICENSE /tmp/x/ && cd /tmp/x && makepkg -si
+# Never inside the plugin folder: every write there reloads the shell.
+pkgname=xray-omarchy
+pkgver=0.6.3
+pkgrel=1
+pkgdesc="Xray tunnel for Omarchy: TUN, killswitch, split DNS and subscriptions behind one CLI (backend of the bar plugin)"
+# x86_64 only: the core sums are pinned for Xray-linux-64.zip (core-sums.json).
+arch=(x86_64)
+url="https://github.com/grigabyte/xray-omarchy"
+license=(MIT)
+depends=(python sudo systemd iproute2 nftables networkmanager libcap libnotify curl
+         v2ray-geoip v2ray-domain-list-community)
+optdepends=('tailscale: kept outside the tunnel and the killswitch when present')
+install=xray-omarchy.install
+source=(xray-omarchy
+        xray-omarchy-helper
+        xray-omarchy.sudoers
+        killswitch-test
+        xray-omarchy.service
+        xray-omarchy-watch.service
+        xray-omarchy-trim.service
+        xray-omarchy-trim.timer
+        xray-omarchy-update.service
+        xray-omarchy-update.timer
+        xray-omarchy-killswitch.service
+        core-sums.json
+        LICENSE)
+sha256sums=('7b72065a3a819807fc31cfbe9066db6f5ba702a02539921887583c7a5e3fc25d'
+            '8866ba18e054363354d964289713a29b4291443da2b3cfe246aca29786f0e4af'
+            '2c74e1009cbad77e9efc4699d42b5869deb2748fe2a8f3602cf2adb8de4766bf'
+            '2995d2ccd91955182270229706d480814735e59d1b04e6b36ce3e5b1c1bf3979'
+            '2d4cc709c66b7cddcdd82e39855e3d4954352c9e5e980fbd731b6236010cd5ad'
+            '35941cd9d145c8a4c444268c0dcfdd632746bc1860c044a30afcbd2c66f18edf'
+            '0f987351afe24e7ed4312eb2d244d8226bd24f8952f6279507297d873f1dccef'
+            '81ae8c7e1c1e5e8da2ad949543e1aae437c4b26972f3fff4761568b84916c633'
+            '4e5b87c8fb38030f38048097639e525e1deee29c614d117c3136158be62b9d24'
+            '565df7347efd5030429bfbe27baebdee4ac9d7eb27fe2c6e0970f679a5fd19d0'
+            '0fef8b8cacf279e49400d6219d5988f5f38b0aa8934c0e15095baa4e6a1943ca'
+            '4182658859129658a515d8dec0910052311345cc4521ec7f3fc3cb506722353e'
+            'b8ba992616d9c2ca2d63b5faf736d05ad6e68b9a957d9086b07da214bf68f467')
+
+package() {
+  install -Dm755 xray-omarchy "$pkgdir/usr/bin/xray-omarchy"
+  # Root-owned and not writable by anyone else: sudoers lets wheel run exactly this file.
+  install -Dm755 xray-omarchy-helper "$pkgdir/usr/lib/xray-omarchy/xray-omarchy-helper"
+  install -Dm755 killswitch-test "$pkgdir/usr/lib/xray-omarchy/killswitch-test"
+  install -dm750 "$pkgdir/etc/sudoers.d"
+  install -m440 xray-omarchy.sudoers "$pkgdir/etc/sudoers.d/xray-omarchy"
+  local unit
+  for unit in xray-omarchy.service xray-omarchy-watch.service xray-omarchy-trim.service \
+              xray-omarchy-trim.timer xray-omarchy-update.service xray-omarchy-update.timer; do
+    install -Dm644 "$unit" "$pkgdir/usr/lib/systemd/user/$unit"
+  done
+  # Enabled by xray-omarchy.install (`systemctl enable`, so `is-enabled` tells
+  # the truth): it does nothing until `xray-omarchy on` writes
+  # /var/lib/xray-omarchy/killswitch; disabled again on removal.
+  install -Dm644 xray-omarchy-killswitch.service \
+    "$pkgdir/usr/lib/systemd/system/xray-omarchy-killswitch.service"
+  # The SHA-256 of every xray release the helper may install (backend/pin-core.sh).
+  install -Dm644 core-sums.json "$pkgdir/usr/share/xray-omarchy/core-sums.json"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

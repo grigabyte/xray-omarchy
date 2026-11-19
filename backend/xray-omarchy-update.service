@@ -1,0 +1,6 @@
+[Unit]
+Description=xray-omarchy: update subscriptions
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/xray-omarchy update --apply

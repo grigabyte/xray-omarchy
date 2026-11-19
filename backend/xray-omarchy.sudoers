@@ -1,0 +1,3 @@
+# xray-omarchy: the CLI runs its root helper without a password. The helper accepts
+# only a closed list of actions and checks every argument (see its --help).
+%wheel ALL=(root) NOPASSWD: /usr/lib/xray-omarchy/xray-omarchy-helper

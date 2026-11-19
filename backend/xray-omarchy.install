@@ -1,0 +1,92 @@
+# pacman scriptlets. The tunnel itself is per user (systemd --user); the system
+# side is the helper's state: ip rules, the nftables table, the DNS of the
+# NetworkManager connections it switched (with their saved settings) and the
+# xray core, all under /var/lib/xray-omarchy.
+
+check_sudoers() {
+  # A sudoers file that does not parse breaks sudo for everyone: never leave one.
+  if ! visudo -cf /etc/sudoers.d/xray-omarchy >/dev/null 2>&1; then
+    rm -f /etc/sudoers.d/xray-omarchy
+    echo "==> ERROR: /etc/sudoers.d/xray-omarchy did not pass visudo -cf and was removed;"
+    echo "    the panel cannot switch the tunnel until the package is reinstalled."
+  fi
+}
+
+# The boot-time killswitch, enabled the ordinary way (a link in
+# /etc/systemd/system/multi-user.target.wants): `systemctl is-enabled` says
+# enabled. Up to 0.6.2 the package shipped that link under /usr/lib, which
+# worked but read as "disabled".
+enable_killswitch_unit() {
+  systemctl enable xray-omarchy-killswitch.service >/dev/null 2>&1 ||
+    echo "==> WARNING: could not enable xray-omarchy-killswitch.service; run: sudo systemctl enable xray-omarchy-killswitch.service"
+}
+
+post_install() {
+  check_sudoers
+  enable_killswitch_unit
+  cat <<'MSG'
+==> xray-omarchy installed.
+    Once:           xray-omarchy core update     (official XTLS xray; only a release whose
+                                                  SHA-256 this package pins is installed)
+    Per user, once: systemctl --user enable xray-omarchy-update.timer xray-omarchy-trim.timer xray-omarchy-watch.service
+                    xray-omarchy sub add NAME URL && xray-omarchy update
+                    xray-omarchy on
+    The bar plugin's "Install required components…" runs all of this.
+    sudo without a password is allowed only for /usr/lib/xray-omarchy/xray-omarchy-helper (group wheel).
+MSG
+}
+
+post_upgrade() {
+  check_sudoers
+  # From 0.6.2 or older the package's own link is gone with the upgrade:
+  # enabled once here. A later upgrade leaves the admin's choice alone.
+  if [[ $(vercmp "$2" 0.6.3) -lt 0 ]]; then
+    enable_killswitch_unit
+  fi
+  # 0.6.0 left the core's version directories 0755: any local user could run the
+  # core with its capabilities. Now root and group wheel only (the members the
+  # sudo rule already trusts). Only the directories: a chown on the binary
+  # would drop its capabilities.
+  local d
+  for d in /var/lib/xray-omarchy/core/*; do
+    [[ -d $d && ! -L $d && ${d##*/} =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$ ]] || continue
+    chown root:wheel "$d" && chmod 0750 "$d"
+  done
+  # The killswitch, if on, is loaded again by this version: its local networks
+  # checked (0.6.0 accepted any) and the loaded table remembered, so `status`
+  # can tell it from one changed by hand (without this it says "tampered"
+  # until the tunnel restarts).
+  /usr/lib/xray-omarchy/xray-omarchy-helper killswitch boot >/dev/null 2>&1 || true
+  # 0.5 kept the core in each user's ~/.local/lib/xray-omarchy; it now lives in
+  # /var/lib/xray-omarchy/core and only the helper installs it.
+  if [[ $(vercmp "$2" 0.6.0) -lt 0 ]]; then
+    cat <<'MSG'
+==> The xray core moved to /var/lib/xray-omarchy/core: run `xray-omarchy core update` once
+    (the panel's "Update components…" does it), then delete the old copy:
+    rm -rf ~/.local/lib/xray-omarchy
+MSG
+  fi
+}
+
+pre_remove() {
+  # Stop the tunnel of every logged-in user, then undo the system side.
+  local user
+  for user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+    systemctl --user -M "$user@" disable --now xray-omarchy.service xray-omarchy-watch.service \
+      xray-omarchy-update.timer xray-omarchy-trim.timer >/dev/null 2>&1 || true
+  done
+  /usr/lib/xray-omarchy/xray-omarchy-helper reset || true
+  # While the unit file is still there: removes the link enable made.
+  systemctl disable xray-omarchy-killswitch.service >/dev/null 2>&1 || true
+}
+
+post_remove() {
+  cat <<'MSG'
+==> xray-omarchy removed: routes, killswitch table, system DNS (as saved) are back as before,
+    and the xray core with its capabilities is gone (/var/lib/xray-omarchy).
+    Your subscriptions and settings stay in your home:
+      ~/.config/xray-omarchy ~/.local/state/xray-omarchy ~/.local/share/xray-omarchy ~/.cache/xray-omarchy
+    Users who were not logged in keep links to the removed units in
+    ~/.config/systemd/user/*.wants/ (harmless; `systemctl --user disable xray-omarchy.service` clears them).
+MSG
+}

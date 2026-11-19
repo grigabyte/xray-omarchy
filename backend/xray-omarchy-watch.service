@@ -1,0 +1,14 @@
+[Unit]
+Description=xray-omarchy: desktop notifications about the tunnel (read-only watcher)
+# Watches the tunnel only while it runs: stops and restarts together with it.
+After=xray-omarchy.service
+PartOf=xray-omarchy.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/xray-omarchy watch
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=xray-omarchy.service

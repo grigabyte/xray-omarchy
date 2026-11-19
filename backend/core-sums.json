@@ -1,0 +1,19 @@
+{
+ "schemaVersion": 1,
+ "comment": "SHA-256 of the official Xray-linux-64.zip per xray version, checked against the release's .dgst when pinned (backend/pin-core.sh). The root helper installs only these.",
+ "source": "https://github.com/XTLS/Xray-core/releases/download/",
+ "assets": {
+  "x86_64": "Xray-linux-64.zip"
+ },
+ "versions": {
+  "26.11.9": {
+   "x86_64": "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82"
+  },
+  "26.10.31": {
+   "x86_64": "e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214"
+  },
+  "26.10.21": {
+   "x86_64": "0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978"
+  }
+ }
+}

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Killswitch check (nftables table inet xray-omarchy): stops the core for ~25 s,
+# checks that nothing gets out while the network's DNS, the LAN and Tailscale
+# still work, then starts the core again. The connection drops meanwhile, so run
+# it detached:
+#   systemd-run --user --unit=xray-omarchy-kstest --collect /usr/lib/xray-omarchy/killswitch-test
+# Optional: XRAY_OMARCHY_CHECK_LAN=host[:port] — a LAN host with HTTPS that must
+# answer (pass it with -E XRAY_OMARCHY_CHECK_LAN=...).
+# Log: ~/.local/state/xray-omarchy/killswitch-test.log
+set -u
+LOG="$HOME/.local/state/xray-omarchy/killswitch-test.log"
+mkdir -p "$(dirname "$LOG")"
+exec >"$LOG" 2>&1
+CLI=/usr/bin/xray-omarchy
+HELPER=/usr/lib/xray-omarchy/xray-omarchy-helper
+UNIT=xray-omarchy.service
+
+# Two fixed fields of `status --json`, read without evaluating anything.
+lan_dns() { python3 -I -c 'import json,sys; d=json.loads(sys.stdin.read().splitlines()[-1]); print((d.get("network") or {}).get("lan_dns") or "")'; }
+# A network DNS outside the local networks is not let past the killswitch (a
+# warning in status says so): then it must be closed, not open.
+dns_public() { python3 -I -c 'import json,sys; d=json.loads(sys.stdin.read().splitlines()[-1]); a=sys.argv[1]; print(any(("DNS %s is not in a local network" % a) in w for w in d.get("warnings") or []))' "$1"; }
+protected() { python3 -I -c 'import json,sys; d=json.loads(sys.stdin.read().splitlines()[-1]); print(bool((d.get("protection") or {}).get("ok")))'; }
+LAN_DNS=$("$CLI" status --json | lan_dns)
+# One DNS query over UDP to SERVER:53: 0 when that server answers. Python is a
+# dependency of the package already; dig (bind) is not installed everywhere, and
+# a missing dig made "foreign DNS closed" pass without any query being sent.
+DNSQ='
+import os, socket, struct, sys
+server, name = sys.argv[1:3]
+q = os.urandom(2) + struct.pack(">HHHHH", 0x0100, 1, 0, 0, 0)
+q += b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+s = socket.socket(socket.AF_INET6 if ":" in server else socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+s.sendto(q, (server, 53))
+sys.exit(0 if s.recv(4096)[:2] == q[:2] else 1)'
+trap 'systemctl --user start "$UNIT"' EXIT
+echo "=== killswitch check $(date '+%F %T') ==="
+echo "table inet xray-omarchy: $(sudo -n "$HELPER" killswitch status 2>&1)"
+FAIL=0
+# The watcher stops with the core (PartOf): no notifications about the check.
+systemctl --user stop "$UNIT"
+T0=$(date +%s)
+sleep 2
+must_fail() { if timeout 7 "${@:2}" >/dev/null 2>&1; then echo "LEAK    $1"; FAIL=1; else echo "OK      $1 — closed"; fi; }
+# Closed and refused at once (TCP reset, ICMP admin-prohibited), not left to time out.
+ms() { local t=${EPOCHREALTIME/[.,]/}; echo $(( t / 1000 )); }
+must_refuse() {
+  local t0 rc took
+  t0=$(ms); timeout 7 "${@:2}" >/dev/null 2>&1; rc=$?; took=$(( $(ms) - t0 ))
+  if [ "$rc" -eq 0 ]; then echo "LEAK    $1"; FAIL=1
+  elif [ "$took" -ge 1000 ]; then echo "SLOW    $1 — closed, but only after ${took} ms (not refused at once)"; FAIL=1
+  else echo "OK      $1 — refused in ${took} ms"; fi
+}
+must_pass() { if timeout 8 "${@:2}" >/dev/null 2>&1; then echo "OK      $1 — works"; else echo "FAILED  $1"; FAIL=1; fi; }
+must_refuse "out by address (1.1.1.1:443)"      curl -s -m 5 https://1.1.1.1
+must_refuse "IPv6 out by address ([2606:4700:4700::1111]:443)" curl -6 -s -m 5 "https://[2606:4700:4700::1111]"
+must_fail "out by name (github.com)"            curl -s -m 5 https://github.com
+must_fail "foreign DNS 8.8.8.8:53"              python3 -I -c "$DNSQ" 8.8.8.8 github.com
+must_fail "IPv6 out"                            curl -6 -s -m 5 https://ipv6.google.com
+if [ -n "$LAN_DNS" ] && [ "$("$CLI" status --json | dns_public "$LAN_DNS")" = "True" ]; then
+  must_fail "network DNS $LAN_DNS (not in a local network)" python3 -I -c "$DNSQ" "$LAN_DNS" example.com
+elif [ -n "$LAN_DNS" ]; then
+  must_pass "network DNS $LAN_DNS"              python3 -I -c "$DNSQ" "$LAN_DNS" example.com
+else
+  echo "FAILED  network DNS unknown (status --json network.lan_dns)"; FAIL=1
+fi
+[ -n "${XRAY_OMARCHY_CHECK_LAN:-}" ] && must_pass "LAN host $XRAY_OMARCHY_CHECK_LAN" curl -sk -m 6 -o /dev/null "https://$XRAY_OMARCHY_CHECK_LAN"
+command -v tailscale >/dev/null && \
+  must_pass "Tailscale online"                  bash -c "tailscale status --json | grep -q '\"Online\": true'"
+echo "=== starting the core (was down $(( $(date +%s) - T0 )) s) ==="
+trap - EXIT
+systemctl --user start "$UNIT"
+ok=""
+for i in $(seq 1 30); do
+  ok=$("$CLI" status --json 2>/dev/null | protected 2>/dev/null)
+  [ "$ok" = "True" ] && { echo "OK      core is up, protection in place (${i} s)"; break; }
+  sleep 1
+done
+[ "$ok" = "True" ] || { echo "FAILED  core did not come up or protection is incomplete"; FAIL=1; }
+if [ "$FAIL" -eq 0 ]; then echo "=== RESULT: the killswitch holds ==="; else echo "=== RESULT: FAILURES ==="; fi

@@ -1,0 +1,6 @@
+[Unit]
+Description=xray-omarchy: traffic accounting and log trimming in tmpfs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/xray-omarchy trim

@@ -1,0 +1,1231 @@
+#!/usr/bin/python3 -I
+"""xray-omarchy-helper: the only part of xray-omarchy that runs as root.
+
+Called by the xray-omarchy CLI as `sudo -n /usr/lib/xray-omarchy/xray-omarchy-helper ACTION ...`.
+The list of actions is closed and every argument is checked; anything else
+is refused with exit code 2.
+
+  route up | down
+      ip rules and table that send IPv4 traffic into the TUN device xray-omarchy0.
+      `up` only when the device is held by the caller's own xray core (the
+      binary staged here, run by the uid that called sudo); exit 4 otherwise.
+  killswitch on [--lan-dns IP]... [--local-net CIDR]... [--dhcp-server IPV4]...
+      load table `inet xray-omarchy` and remember it is on (/var/lib/xray-omarchy/killswitch).
+      Without arguments the saved parameters are used. Local networks are only
+      private, CGNAT, link-local and ULA ranges; DNS and DHCP servers only inside them.
+  killswitch off      remove the table, remember it is off.
+  killswitch status   print on | off | tampered | unknown (from the kernel, not the
+                      flag): tampered when the loaded table differs from the one loaded.
+  killswitch boot     at boot (xray-omarchy-killswitch.service): load the table if it is on.
+  dns on UUID IFACE
+      UUID must be the connection active on IFACE, and 127.0.0.1:53 must be
+      served by the caller's own xray core (exit 4 otherwise). Saves the
+      connection's own DNS settings (ipv4/ipv6 dns, ignore-auto-dns,
+      dns-priority) to /var/lib/xray-omarchy/dns/UUID.json once, then points it
+      to the core (127.0.0.1) and drops its IPv6 DNS.
+  dns off UUID IFACE
+      put back exactly the saved settings. Only for a connection `dns on` saved.
+  dns list            the connections `dns on` switched, as JSON.
+  core stage VERSION FILE
+      FILE (the caller's own regular file, opened with the caller's rights) is the
+      official Xray-linux-64.zip of xray VERSION. It is copied into
+      /var/lib/xray-omarchy/core (root's), its SHA-256 compared with the sum
+      this package pins for VERSION (/usr/share/xray-omarchy/core-sums.json),
+      and only then is the xray binary taken out of the copy and given
+      CAP_NET_ADMIN and CAP_NET_BIND_SERVICE; it is executable only by root
+      and group wheel. Exit 3: the sum does not match; 5: another stage is
+      running; 6: not enough free space.
+  core activate VERSION
+      make a staged VERSION the one the tunnel runs (core/current); the one
+      before it becomes core/previous, and the one before that is kept until
+      the next activation (core/older), for a rollback.
+  core rollback VERSION
+      after a failed update: VERSION (core/previous) becomes current again,
+      the failed version is deleted, and core/previous points to the version
+      that ran before VERSION (core/older), or is removed.
+  reset
+      undo everything above: routes, the killswitch table, the DNS of every
+      saved connection, /var/lib/xray-omarchy with the core. Run by the package on removal.
+"""
+import contextlib
+import fcntl
+import grp
+import hashlib
+import ipaddress
+import json
+import os
+import platform
+import pwd
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+
+DEV = "xray-omarchy0"
+MARK = 0x1F4            # sockets of the core itself
+TS_MARK, TS_MASK = 0x80000, 0xFF0000  # Tailscale
+TABLE = 7000
+PREF_MAIN = 9100
+PREF_TUN = 9110
+NFT_TABLE = "xray-omarchy"
+STATE_DIR = "/var/lib/xray-omarchy"
+FLAG = os.path.join(STATE_DIR, "killswitch")
+DNS_DIR = os.path.join(STATE_DIR, "dns")
+CORE_DIR = os.path.join(STATE_DIR, "core")
+SUMS_FILE = "/usr/share/xray-omarchy/core-sums.json"
+DEFAULT_LOCAL_NETS = ["10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+# What may ever count as a local network: private (RFC 1918), CGNAT, link-local
+# and ULA. A wider network (0.0.0.0/0, two /1, a public one) would let traffic
+# past the killswitch while it still says "on".
+ALLOWED_LOCAL_NETS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16",
+    "fc00::/7", "fe80::/10")]
+# The core may be run only by root and this group: the same members the sudo
+# rule lets run this helper (xray-omarchy.sudoers).
+CORE_GROUP = "wheel"
+# Interfaces that never carry traffic out of the machine.
+PASS_IFACES = ["lo", DEV, "tailscale0"]
+# Clock daemons that may reach NTP (udp 123) with the killswitch on; a user
+# that does not exist on this machine is skipped.
+TIME_USERS = ("systemd-timesync", "chrony", "ntp")
+# Mobile modems: NetworkManager and udev name them ww* (wwan0, wwp0s20f0u6).
+# Raw-IP modems have no link type nftables can name, so they go by name,
+# also ones plugged in after the table was loaded.
+MODEM_PREFIX = "ww*"
+
+CORE_ZIP_MAX = 64 << 20
+CORE_BIN_MAX = 160 << 20
+# Left free on the disk after a stage: the core never fills it up.
+STAGE_RESERVE = 64 << 20
+STAGE_LOCK = ".stage.lock"
+CORE_MEMBER = "xray"
+CORE_ASSET = "Xray-linux-64.zip"
+
+IFACE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,15}")
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+VERSION_RE = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}")
+SHA_RE = re.compile(r"[0-9a-f]{64}")
+# Only these characters ever reach the nftables text: an address or a network
+# (no %zone, no spaces, no newlines, no quotes or braces).
+NFT_VALUE_RE = re.compile(r"[0-9a-fA-F:.]{2,45}(?:/[0-9]{1,3})?")
+ENV = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "LANG": "C", "LC_ALL": "C"}
+
+# NetworkManager properties `dns on` changes, saved before and put back by `dns off`.
+DNS_PROPS = ("ipv4.dns", "ipv4.ignore-auto-dns", "ipv4.dns-priority",
+             "ipv6.dns", "ipv6.ignore-auto-dns", "ipv6.dns-priority")
+DNS_ON = (("ipv4.dns", "127.0.0.1"), ("ipv4.ignore-auto-dns", "yes"),
+          ("ipv6.dns", ""), ("ipv6.ignore-auto-dns", "yes"))
+
+
+class Refused(Exception):
+    pass
+
+
+class Mismatch(Refused):
+    pass
+
+
+class Foreign(Refused):
+    """The TUN or 127.0.0.1:53 is held by something other than the caller's core (exit 4)."""
+
+
+class Busy(Refused):
+    """Another `core stage` is running (exit 5)."""
+
+
+class NoSpace(Refused):
+    """Not enough free space to stage the core (exit 6)."""
+
+
+def tool(name):
+    for d in ("/usr/bin", "/usr/sbin", "/bin", "/sbin"):
+        path = os.path.join(d, name)
+        if os.access(path, os.X_OK):
+            return path
+    raise Refused("%s not found" % name)
+
+
+def run(cmd, stdin=None):
+    return subprocess.run([tool(cmd[0])] + list(cmd[1:]), input=stdin, capture_output=True,
+                          text=True, env=ENV, timeout=30)
+
+
+def first_line(text, limit=160):
+    """One line of a tool's error, printable ASCII only: never the input it quotes."""
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return "".join(c for c in line if " " <= c <= "~")[:limit]
+
+
+# ---------------------------------------------------------------- checks
+
+def check_ip(text):
+    # Characters first: ipaddress keeps an IPv6 zone (fe80::1%eth0) as it was
+    # given, whatever it holds.
+    if not isinstance(text, str) or not re.fullmatch(r"[0-9a-fA-F:.]{2,45}", text):
+        raise Refused("not an IP address: %r" % (text,))
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        raise Refused("not an IP address: %r" % text)
+    if getattr(addr, "scope_id", None):
+        raise Refused("an address with a zone is not allowed: %r" % text)
+    return str(addr)
+
+
+def check_net(text):
+    if not isinstance(text, str) or not NFT_VALUE_RE.fullmatch(text):
+        raise Refused("not a network: %r" % (text,))
+    try:
+        net = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        raise Refused("not a network: %r" % text)
+    if not local_net(net):
+        raise Refused("not a local network: %s (only private, CGNAT, link-local and ULA ranges, "
+                      "no wider than /8 for IPv4 and /7 for IPv6)" % net)
+    return str(net)
+
+
+def local_net(net):
+    """net lies inside one of ALLOWED_LOCAL_NETS (so it is no wider than /8 or /7)."""
+    return any(net.version == a.version and net.subnet_of(a) for a in ALLOWED_LOCAL_NETS)
+
+
+def inside(addr, nets):
+    """addr (text) lies in one of nets (texts)."""
+    a = ipaddress.ip_address(addr)
+    return any(a.version == n.version and a in n for n in (ipaddress.ip_network(x) for x in nets))
+
+
+def check_iface(text):
+    if not IFACE_RE.fullmatch(text or "") or text in (".", ".."):
+        raise Refused("bad interface name: %r" % text)
+    return text
+
+
+def check_uuid(text):
+    if not UUID_RE.fullmatch(text or ""):
+        raise Refused("bad connection UUID: %r" % text)
+    return text.lower()
+
+
+def check_version(text):
+    if not VERSION_RE.fullmatch(text or ""):
+        raise Refused("bad version: %r" % text)
+    return text
+
+
+# ---------------------------------------------------------------- whose core
+
+def caller_ids():
+    """(uid, gid) of the user who ran sudo, or None when root runs the helper itself."""
+    uid, gid = os.environ.get("SUDO_UID", ""), os.environ.get("SUDO_GID", "")
+    if not uid:
+        return None
+    if not uid.isdigit() or not gid.isdigit():
+        raise Refused("unexpected SUDO_UID/SUDO_GID")
+    return int(uid), int(gid)
+
+
+def proc_real_uid(pid):
+    with open("/proc/%d/status" % pid, encoding="utf8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("Uid:"):
+                return int(line.split()[1])
+    return None
+
+
+def own_core(pid):
+    """pid runs a core staged here (root's regular file under core/VERSION/xray)
+    with the real uid of the caller (any uid when root calls)."""
+    try:
+        exe = os.readlink("/proc/%d/exe" % pid)
+        folder, base = os.path.split(exe)
+        if base != "xray" or os.path.dirname(folder) != CORE_DIR \
+                or not VERSION_RE.fullmatch(os.path.basename(folder)):
+            return False
+        st = os.lstat(exe)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0:
+            return False
+        ids = caller_ids()
+        return ids is None or proc_real_uid(pid) == ids[0]
+    except (OSError, ValueError):
+        return False
+
+
+def tun_holders(dev):
+    """PIDs of the processes that have the TUN device dev open (fdinfo `iff:`)."""
+    holders = set()
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            fds = os.listdir("/proc/%d/fd" % pid)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink("/proc/%d/fd/%s" % (pid, fd)) != "/dev/net/tun":
+                    continue
+                with open("/proc/%d/fdinfo/%s" % (pid, fd), encoding="utf8", errors="replace") as fh:
+                    if any(line.split() == ["iff:", dev] for line in fh):
+                        holders.add(pid)
+            except OSError:
+                continue
+    return holders
+
+
+IFF_PERSIST = 0x0800
+
+
+def check_tun_owner():
+    """The device exists and every process holding it is the caller's own core."""
+    if not os.path.exists("/sys/class/net/" + DEV):
+        raise Refused("device %s does not exist" % DEV)
+    # The core makes its TUN for as long as it runs. A persistent one was made
+    # by someone else (ip tuntap) and outlives the core: whoever opens it next
+    # would get the traffic the routes send there.
+    try:
+        with open("/sys/class/net/%s/tun_flags" % DEV, encoding="ascii") as fh:
+            flags = int(fh.read().strip(), 16)
+    except (OSError, ValueError):
+        raise Foreign("device %s is not a TUN device" % DEV)
+    if flags & IFF_PERSIST:
+        raise Foreign("device %s is a persistent TUN made outside your xray core" % DEV)
+    holders = tun_holders(DEV)
+    if not holders:
+        raise Foreign("device %s is not held by any process: it is not your xray core's TUN" % DEV)
+    other = sorted(p for p in holders if not own_core(p))
+    if other:
+        raise Foreign("device %s is held by a process that is not your xray core (pid %s)"
+                      % (DEV, ", ".join(str(p) for p in other[:5])))
+
+
+# Local addresses of a socket that answers queries sent to 127.0.0.1:53.
+DNS_CATCH = ("127.0.0.1", "0.0.0.0", "*", "::", "::ffff:127.0.0.1")
+
+
+def dns_listeners():
+    """[(proto, pids)] of every TCP/UDP listener that receives 127.0.0.1:53."""
+    out = []
+    for proto in ("udp", "tcp"):
+        r = run(["ss", "-H", "-l", "-n", "-p", "-u" if proto == "udp" else "-t", "sport", "=", ":53"])
+        if r.returncode:
+            raise Refused("ss failed: " + first_line(r.stderr))
+        for line in r.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            host = fields[3].rsplit(":", 1)[0].strip("[]").split("%")[0]
+            if host in DNS_CATCH:
+                out.append((proto, [int(p) for p in re.findall(r"pid=([0-9]+)", line)]))
+    return out
+
+
+def check_dns_owner():
+    """127.0.0.1:53 is served by the caller's own core and by nothing else."""
+    listeners = dns_listeners()
+    if not any(proto == "udp" and pids for proto, pids in listeners):
+        raise Foreign("nothing listens on 127.0.0.1:53: your xray core is not running")
+    for proto, pids in listeners:
+        if not pids or not all(own_core(p) for p in pids):
+            raise Foreign("127.0.0.1:53 (%s) is held by a process that is not your xray core (pid %s)"
+                          % (proto, ", ".join(str(p) for p in pids) or "unknown"))
+
+
+# ---------------------------------------------------------------- route
+
+def route(action):
+    if action == "up":
+        check_tun_owner()
+        r = run(["ip", "route", "replace", "default", "dev", DEV, "table", str(TABLE)])
+        if r.returncode:
+            raise Refused(first_line(r.stderr))
+        rules = run(["ip", "rule"]).stdout
+        # Main table without its default route first: LAN, docker, connected nets.
+        # DNS (53) is not let through here: the core intercepts it.
+        if "%d:" % PREF_MAIN not in rules:
+            run(["ip", "rule", "add", "not", "dport", "53", "lookup", "main",
+                 "suppress_prefixlength", "0", "pref", str(PREF_MAIN)])
+        # Everything else into the TUN, except the core's own sockets.
+        if "%d:" % PREF_TUN not in rules:
+            run(["ip", "rule", "add", "not", "fwmark", hex(MARK), "lookup", str(TABLE),
+                 "pref", str(PREF_TUN)])
+        rules = run(["ip", "rule"]).stdout
+        if "%d:" % PREF_TUN not in rules or "%d:" % PREF_MAIN not in rules:
+            raise Refused("ip rules were not added")
+        print("route: up")
+        return 0
+    for pref in (PREF_TUN, PREF_MAIN):
+        for _ in range(20):
+            if run(["ip", "rule", "del", "pref", str(pref)]).returncode:
+                break
+    run(["ip", "route", "flush", "table", str(TABLE)])
+    print("route: down")
+    return 0
+
+
+# ---------------------------------------------------------------- killswitch
+
+def load_flag():
+    try:
+        with open(FLAG, encoding="utf8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf8") as fh:
+        json.dump(data, fh, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def save_flag(data):
+    save_state(FLAG, data)
+
+
+def physical_ifaces():
+    """Interfaces backed by hardware (wired, Wi-Fi, USB modems): they have a `device` link."""
+    out = []
+    for name in sorted(os.listdir("/sys/class/net")):
+        if name not in PASS_IFACES and os.path.exists("/sys/class/net/%s/device" % name) \
+                and IFACE_RE.fullmatch(name):
+            out.append(name)
+    return out
+
+
+def time_uids():
+    uids = []
+    for name in TIME_USERS:
+        try:
+            uids.append(pwd.getpwnam(name).pw_uid)
+        except KeyError:
+            pass
+    return sorted(set(uids))
+
+
+def nft_values(values):
+    """Every value that goes into the table, checked again right where the text is
+    built: the saved flag is read back from disk too."""
+    out = []
+    for v in values:
+        if not isinstance(v, str) or not NFT_VALUE_RE.fullmatch(v):
+            raise Refused("refusing to put %r into nftables" % (v,))
+        out.append(v)
+    return out
+
+
+def ruleset(lan_dns, local_nets, dhcp_servers=()):
+    local_nets = nft_values(local_nets)
+    lan_dns = nft_values(lan_dns)
+    dhcp_servers = nft_values(dhcp_servers)
+    v4 = [n for n in local_nets if ipaddress.ip_network(n).version == 4]
+    v6_local = [n for n in local_nets if ipaddress.ip_network(n).version == 6]
+    v6 = v6_local + ["fe80::/10", "ff02::/16"]
+    dns4 = [a for a in lan_dns if ipaddress.ip_address(a).version == 4]
+    dns6 = [a for a in lan_dns if ipaddress.ip_address(a).version == 6]
+    dhcp4 = [a for a in dhcp_servers if ipaddress.ip_address(a).version == 4]
+    phys = physical_ifaces()
+    uids = time_uids()
+    lines = [
+        # Create-then-delete makes the reload one atomic transaction.
+        "table inet %s {}" % NFT_TABLE,
+        "delete table inet %s" % NFT_TABLE,
+        "table inet %s {" % NFT_TABLE,
+        "  set phys { type ifname; %s}" % ("elements = { %s } " % ", ".join('"%s"' % p for p in phys)
+                                          if phys else ""),
+        "  chain output {",
+        # Policy accept: traffic of other interfaces (docker, VMs) is not ours to judge.
+        "    type filter hook output priority filter; policy accept;",
+    ]
+    lines += ['    oifname "%s" accept' % i for i in PASS_IFACES]
+    lines += [
+        "    meta mark 0x%x accept" % MARK,
+        "    meta mark and 0x%x == 0x%x accept" % (TS_MASK, TS_MARK),
+    ]
+    # IPv6 DNS on the link (the router's address from RA, fe80::…) would answer
+    # past the core: only the network's own DNS servers are let through.
+    v6_dns_scope = "ip6 daddr { %s }" % ", ".join(v6)
+    if dns6:
+        lines.append("    %s ip6 daddr != { %s } meta l4proto { tcp, udp } th dport 53 reject"
+                     % (v6_dns_scope, ", ".join(dns6)))
+    else:
+        lines.append("    %s meta l4proto { tcp, udp } th dport 53 reject" % v6_dns_scope)
+    if v4:
+        lines.append("    ip daddr { %s } accept" % ", ".join(v4))
+    lines.append("    ip6 daddr { %s } accept" % ", ".join(v6))
+    # DHCP: from the client port to the server port only, broadcast or the
+    # network's DHCP server (renewals are unicast to it).
+    lines.append("    udp sport 68 udp dport 67 ip daddr { %s } accept"
+                 % ", ".join(["255.255.255.255"] + dhcp4))
+    if dns4:
+        lines.append("    ip daddr { %s } meta l4proto { tcp, udp } th dport 53 accept" % ", ".join(dns4))
+    if dns6:
+        lines.append("    ip6 daddr { %s } meta l4proto { tcp, udp } th dport 53 accept" % ", ".join(dns6))
+    # Clock: Reality does not connect without exact time. Only the clock daemon.
+    if uids:
+        lines.append("    udp dport 123 meta skuid { %s } accept" % ", ".join(str(u) for u in uids))
+    # Everything else leaving through hardware is stopped: ethernet, Wi-Fi and PPP
+    # by type, modems by name (also ones plugged in later), the rest seen at load time.
+    lines.append("    meta oiftype { ether, ppp } goto block")
+    lines.append('    oifname "%s" goto block' % MODEM_PREFIX)
+    lines.append("    oifname @phys goto block")
+    lines += [
+        "  }",
+        "  chain block {",
+        "    counter",
+        # Refused at once, not dropped: a program sees "connection refused" or
+        # "administratively prohibited" in a millisecond instead of waiting out
+        # its own timeout with the core down. A refusal is made by this machine
+        # and goes back to the sending socket over lo: nothing leaves.
+        # IPv6 the same way: the tunnel carries IPv4 only, and a refused IPv6
+        # makes programs fall back to IPv4 (into the tunnel).
+        "    meta l4proto tcp reject with tcp reset",
+        "    meta nfproto ipv4 reject with icmp type admin-prohibited",
+        "    meta nfproto ipv6 reject with icmpv6 type admin-prohibited",
+        # Never reached by IPv4 or IPv6; the last word of the chain stays a drop.
+        "    drop",
+        "  }",
+        "}",
+    ]
+    text = "\n".join(lines) + "\n"
+    # Last guard: nothing but the table's own syntax.
+    if re.search(r"[^\x20-\x7e\n]", text) or text.count("\n") != len(lines):
+        raise Refused("refusing an nftables text with unexpected characters")
+    return text
+
+
+def table_listing():
+    """(returncode, the table as the kernel holds it without counters, stderr)."""
+    r = run(["nft", "-s", "list", "table", "inet", NFT_TABLE])
+    return r.returncode, r.stdout, r.stderr
+
+
+def table_digest(text):
+    return hashlib.sha256(text.encode("utf8")).hexdigest()
+
+
+def table_state():
+    """on: the table in the kernel is exactly the one `on`/`boot` loaded (its
+    listing's SHA-256 was saved then); tampered: it is there but differs."""
+    code, out, err = table_listing()
+    if code == 0:
+        if "hook output" not in out or "drop" not in out:
+            return "tampered"
+        saved = load_flag().get("table_sha256")
+        return "on" if isinstance(saved, str) and saved == table_digest(out) else "tampered"
+    if "No such file" in err:
+        return "off"
+    return "unknown"
+
+
+def sane_params(flag):
+    """The saved parameters with what the checks of `on` would refuse dropped
+    (a flag saved by an older version): the table is still loaded, with the
+    default local networks if none is left. Characters that do not belong in
+    an address are not dropped but refused (nft_values): that flag was tampered with."""
+    nets, dropped = [], []
+    for n in flag.get("local_nets") or []:
+        nft_values([n])
+        try:
+            nets.append(check_net(n))
+        except Refused:
+            dropped.append(n)
+    nets = nets or list(DEFAULT_LOCAL_NETS)
+    lan_dns, dhcp = [], []
+    for key, out in (("lan_dns", lan_dns), ("dhcp_servers", dhcp)):
+        for a in flag.get(key) or []:
+            nft_values([a])
+            try:
+                addr = check_ip(a)
+            except Refused:
+                dropped.append(a)
+                continue
+            (out if inside(addr, nets) and (key == "lan_dns" or ipaddress.ip_address(addr).version == 4)
+             else dropped).append(addr)
+    for d in dropped:
+        print("killswitch: saved value %s is not allowed, left out" % first_line(str(d), 60))
+    return lan_dns, nets, dhcp
+
+
+def killswitch_load(flag):
+    lan_dns, nets, dhcp = sane_params(flag)
+    text = ruleset(lan_dns, nets, dhcp)
+    r = run(["nft", "-f", "-"], stdin=text)
+    if r.returncode:
+        raise Refused("nft refused the table: " + first_line(r.stderr))
+    code, out, err = table_listing()
+    if code:
+        raise Refused("the table did not load: " + first_line(err))
+    flag.update(lan_dns=lan_dns, local_nets=nets, dhcp_servers=dhcp, table_sha256=table_digest(out))
+
+
+def killswitch(argv):
+    if not argv:
+        raise Refused("killswitch on|off|status|boot")
+    action, rest = argv[0], argv[1:]
+    if action == "status":
+        if rest:
+            raise Refused("status takes no arguments")
+        state = table_state()
+        print(state)
+        return 0 if state in ("on", "off") else 1
+    if action == "off":
+        if rest:
+            raise Refused("off takes no arguments")
+        flag = load_flag()
+        flag.update(enabled=False, time=int(time.time()))
+        save_flag(flag)
+        if table_state() != "off":
+            run(["nft", "delete", "table", "inet", NFT_TABLE])
+        state = table_state()
+        print("killswitch: %s" % state)
+        return 0 if state == "off" else 1
+    if action == "boot":
+        if rest:
+            raise Refused("boot takes no arguments")
+        flag = load_flag()
+        if not flag.get("enabled"):
+            print("killswitch: off (not enabled)")
+            return 0
+        killswitch_load(flag)
+        save_flag(flag)
+        state = table_state()
+        print("killswitch: %s" % state)
+        return 0 if state == "on" else 1
+    if action != "on":
+        raise Refused("unknown killswitch action: %r" % action)
+    lan_dns, nets, dhcp = [], [], []
+    i = 0
+    while i < len(rest):
+        if rest[i] not in ("--lan-dns", "--local-net", "--dhcp-server") or i + 1 >= len(rest):
+            raise Refused("unexpected argument: %r" % rest[i])
+        if rest[i] == "--lan-dns":
+            lan_dns.append(check_ip(rest[i + 1]))
+        elif rest[i] == "--dhcp-server":
+            addr = check_ip(rest[i + 1])
+            if ipaddress.ip_address(addr).version != 4:
+                raise Refused("DHCP server must be IPv4: %r" % addr)
+            dhcp.append(addr)
+        else:
+            nets.append(check_net(rest[i + 1]))
+        i += 2
+    if len(lan_dns) > 8 or len(nets) > 64 or len(dhcp) > 4:
+        raise Refused("too many addresses")
+    flag = load_flag()
+    if rest:
+        # The network's DNS as the CLI sees it now; none (a static DNS outside
+        # the local networks) forgets the previous network's, as for DHCP below.
+        flag["lan_dns"] = sorted(set(lan_dns), key=lan_dns.index)
+    if nets:
+        flag["local_nets"] = sorted(set(nets), key=nets.index)
+    if rest:
+        # A network without a DHCP server forgets the previous network's one.
+        flag["dhcp_servers"] = sorted(set(dhcp), key=dhcp.index)
+    flag.setdefault("lan_dns", [])
+    flag.setdefault("local_nets", DEFAULT_LOCAL_NETS)
+    flag.setdefault("dhcp_servers", [])
+    # The network's DNS and DHCP servers are let through only inside its local
+    # networks: a public DNS server here would be DNS past the tunnel.
+    if rest:
+        for addr in (lan_dns if lan_dns else []) + dhcp:
+            if not inside(addr, flag["local_nets"]):
+                raise Refused("%s is not inside the local networks (%s): not let past the tunnel"
+                              % (addr, ", ".join(flag["local_nets"])))
+    flag.update(enabled=True, time=int(time.time()))
+    killswitch_load(flag)
+    save_flag(flag)
+    state = table_state()
+    print("killswitch: %s" % state)
+    return 0 if state == "on" else 1
+
+
+# ---------------------------------------------------------------- dns
+
+def dns_dir():
+    """/var/lib/xray-omarchy/dns/. Version 0.5 kept one file `dns` ({uuid: iface})
+    without the connection's settings: those entries become snapshots of
+    what 0.5 would have put back (DHCP DNS)."""
+    legacy = {}
+    if os.path.isfile(DNS_DIR) and not os.path.islink(DNS_DIR):
+        try:
+            with open(DNS_DIR, encoding="utf8") as fh:
+                data = json.load(fh)
+            legacy = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            legacy = {}
+        os.unlink(DNS_DIR)
+    os.makedirs(DNS_DIR, mode=0o755, exist_ok=True)
+    for uuid, iface in legacy.items():
+        if UUID_RE.fullmatch(uuid) and isinstance(iface, str) and IFACE_RE.fullmatch(iface):
+            save_state(os.path.join(DNS_DIR, uuid.lower() + ".json"),
+                       {"uuid": uuid.lower(), "iface": iface, "legacy": True,
+                        "props": {"ipv4.dns": "", "ipv4.ignore-auto-dns": "no"}})
+    return DNS_DIR
+
+
+def check_prop(name, value):
+    if not isinstance(value, str) or len(value) > 1024 or re.search(r"[^\x20-\x7e]", value):
+        raise Refused("unexpected value of %s" % name)
+    if name.endswith("ignore-auto-dns") and value not in ("yes", "no"):
+        raise Refused("unexpected value of %s" % name)
+    if name.endswith("dns-priority") and not re.fullmatch(r"-?[0-9]{1,10}", value):
+        raise Refused("unexpected value of %s" % name)
+    return value
+
+
+def load_snapshot(uuid):
+    path = os.path.join(dns_dir(), uuid + ".json")
+    try:
+        with open(path, encoding="utf8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        raise Refused("saved DNS settings of %s are unreadable" % uuid)
+    props = data.get("props") if isinstance(data, dict) else None
+    if not isinstance(props, dict) or not props or any(k not in DNS_PROPS for k in props):
+        raise Refused("saved DNS settings of %s are not valid" % uuid)
+    for k, v in props.items():
+        check_prop(k, v)
+    iface = data.get("iface") if isinstance(data.get("iface"), str) and IFACE_RE.fullmatch(data["iface"]) else ""
+    return {"uuid": uuid, "iface": iface, "props": props}
+
+
+def nm_get(uuid, prop):
+    r = run(["nmcli", "--escape", "no", "-g", prop, "connection", "show", "uuid", uuid])
+    if r.returncode:
+        raise Refused("cannot read %s of %s: %s" % (prop, uuid, first_line(r.stderr)))
+    return check_prop(prop, r.stdout.rstrip("\n"))
+
+
+def nm_modify(uuid, pairs):
+    cmd = ["nmcli", "connection", "modify", "uuid", uuid]
+    for k, v in pairs:
+        cmd += [k, v]
+    r = run(cmd)
+    if r.returncode:
+        raise Refused("nmcli refused the change: " + first_line(r.stderr))
+
+
+def nm_split(line):
+    """One line of `nmcli -t`: fields split on ':', with its escapes (\\: and \\\\) undone."""
+    fields, cur, i = [], "", 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line):
+            cur += line[i + 1]
+            i += 2
+            continue
+        if c == ":":
+            fields.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    fields.append(cur)
+    return fields
+
+
+def active_device(uuid):
+    """The device the connection uuid is active on, or "" when it is not active."""
+    r = run(["nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active"])
+    if r.returncode:
+        raise Refused("cannot list active connections: " + first_line(r.stderr))
+    for line in r.stdout.splitlines():
+        f = nm_split(line)
+        if len(f) >= 4 and f[-3].lower() == uuid:
+            return f[-1]
+    return ""
+
+
+def nm_reapply(iface):
+    # The change takes effect without reconnecting; the device may be gone (other network).
+    if iface and os.path.exists("/sys/class/net/" + iface):
+        run(["nmcli", "device", "reapply", iface])
+
+
+def dns(argv):
+    if argv == ["list"]:
+        out = []
+        for name in sorted(os.listdir(dns_dir())):
+            uuid = name[:-5] if name.endswith(".json") else ""
+            if UUID_RE.fullmatch(uuid):
+                try:
+                    snap = load_snapshot(uuid)
+                except Refused:
+                    continue
+                if snap:
+                    out.append({"uuid": uuid, "iface": snap["iface"]})
+        print(json.dumps(out))
+        return 0
+    if len(argv) != 3 or argv[0] not in ("on", "off"):
+        raise Refused("dns on|off UUID IFACE | dns list")
+    on, uuid, iface = argv[0] == "on", check_uuid(argv[1]), check_iface(argv[2])
+    if not on:
+        snap = load_snapshot(uuid)
+        if not snap:
+            raise Refused("connection %s was not switched by xray-omarchy: nothing to put back" % uuid)
+        # Reapplied on the device the connection is active on (the one given, if
+        # it is that one), else on the one saved: never on some other device.
+        active = active_device(uuid)
+        dns_restore(snap, iface if iface == active else (active or snap["iface"]))
+        return 0
+    if run(["nmcli", "-g", "connection.uuid", "connection", "show", "uuid", uuid]).returncode:
+        raise Refused("no NetworkManager connection %s" % uuid)
+    # Only the connection that carries this machine's traffic now, on its own device.
+    active = active_device(uuid)
+    if active != iface:
+        raise Refused("connection %s is not the one active on %s%s" % (
+            uuid, iface, " (it is active on %s)" % active if active else " (it is not active)"))
+    # 127.0.0.1 becomes the system's DNS: only when the caller's core answers there.
+    check_dns_owner()
+    path = os.path.join(dns_dir(), uuid + ".json")
+    # Saved once: a second `dns on` must not take 127.0.0.1 for the original.
+    if not load_snapshot(uuid):
+        props = {p: nm_get(uuid, p) for p in DNS_PROPS}
+        save_state(path, {"uuid": uuid, "iface": iface, "props": props, "time": int(time.time())})
+    nm_modify(uuid, DNS_ON)
+    nm_reapply(iface)
+    print("dns: on")
+    return 0
+
+
+def dns_restore(snap, iface=None):
+    uuid = snap["uuid"]
+    if run(["nmcli", "-g", "connection.uuid", "connection", "show", "uuid", uuid]).returncode:
+        # The connection was deleted meanwhile: nothing left to put back.
+        os.unlink(os.path.join(DNS_DIR, uuid + ".json"))
+        print("dns: %s is gone, forgotten" % uuid)
+        return
+    nm_modify(uuid, [(p, snap["props"][p]) for p in DNS_PROPS if p in snap["props"]])
+    nm_reapply(iface or snap["iface"])
+    os.unlink(os.path.join(DNS_DIR, uuid + ".json"))
+    print("dns: off")
+
+
+# ---------------------------------------------------------------- the xray core
+
+CAP_NET_BIND_SERVICE = 10
+CAP_NET_ADMIN = 12
+VFS_CAP_REVISION_2 = 0x02000000
+VFS_CAP_FLAGS_EFFECTIVE = 0x000001
+
+
+def pinned_sum(version):
+    """The SHA-256 this package pins for VERSION on this machine, or Refused."""
+    try:
+        st = os.lstat(SUMS_FILE)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise Refused("%s must be a root-owned file" % SUMS_FILE)
+        with open(SUMS_FILE, encoding="utf8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        raise Refused("cannot read %s" % SUMS_FILE)
+    arch = platform.machine()
+    entry = (data.get("versions") or {}).get(version) if isinstance(data, dict) else None
+    value = entry.get(arch) if isinstance(entry, dict) else None
+    if not isinstance(value, str) or not SHA_RE.fullmatch(value):
+        raise Refused("xray %s for %s is not pinned by this package" % (version, arch))
+    return value
+
+
+def core_gid():
+    try:
+        return grp.getgrnam(CORE_GROUP).gr_gid
+    except KeyError:
+        raise Refused("group %s does not exist: the core would have no one to run it" % CORE_GROUP)
+
+
+def core_dirs():
+    os.makedirs(CORE_DIR, mode=0o755, exist_ok=True)
+    for d in (STATE_DIR, CORE_DIR):
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0:
+            raise Refused("%s must be a root-owned directory" % d)
+        os.chmod(d, 0o755)
+    # Version directories: root and the core's group only (0.6.0 left them 0755).
+    # Only the directory: chown on the binary would drop its capabilities.
+    gid = core_gid()
+    for name in os.listdir(CORE_DIR):
+        path = os.path.join(CORE_DIR, name)
+        st = os.lstat(path)
+        if VERSION_RE.fullmatch(name) and stat.S_ISDIR(st.st_mode) and st.st_uid == 0 \
+                and (st.st_gid != gid or stat.S_IMODE(st.st_mode) != 0o750):
+            os.chown(path, 0, gid)
+            os.chmod(path, 0o750)
+    return CORE_DIR
+
+
+def give_caps(fd):
+    permitted = (1 << CAP_NET_BIND_SERVICE) | (1 << CAP_NET_ADMIN)
+    value = struct.pack("<IIIII", VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE, permitted, 0, 0, 0)
+    os.setxattr(fd, "security.capability", value)
+
+
+def seal_core(fd, gid):
+    """root:CORE_GROUP 0750, then the capabilities (a chown drops them, so it goes first)."""
+    os.fchown(fd, 0, gid)
+    os.fchmod(fd, 0o750)
+    give_caps(fd)
+
+
+@contextlib.contextmanager
+def caller_rights(ids):
+    """Path lookups and opens with the rights of the user who ran sudo: root
+    never opens for them what they could not open themselves."""
+    if ids is None:
+        yield
+        return
+    uid, gid = ids
+    try:
+        groups = os.getgrouplist(pwd.getpwuid(uid).pw_name, gid)
+    except KeyError:
+        groups = [gid]
+    saved = os.getgroups()
+    os.setgroups(groups)
+    os.setegid(gid)
+    os.seteuid(uid)
+    try:
+        yield
+    finally:
+        os.seteuid(0)
+        os.setegid(0)
+        os.setgroups(saved)
+
+
+def open_caller_file(source, ids):
+    """FILE opened for reading only after it is known to be the caller's regular
+    file. The path is first opened with O_PATH (no device, FIFO or socket is
+    ever opened for I/O, no link is followed), checked with fstat, and only then
+    reopened through /proc/self/fd for reading — all with the caller's rights."""
+    with caller_rights(ids):
+        try:
+            pfd = os.open(source, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as error:
+            raise Refused("cannot open the file: %s" % (error.strerror or error))
+        try:
+            st = os.fstat(pfd)
+            if not stat.S_ISREG(st.st_mode):
+                raise Refused("not a regular file")
+            # Only the caller's own file: root must not read for them what they
+            # cannot read themselves (another user's or a root-only file).
+            if ids is not None and st.st_uid != ids[0]:
+                raise Refused("the file must be your own (owned by uid %d)" % ids[0])
+            if st.st_size > CORE_ZIP_MAX:
+                raise Refused("larger than %d MiB" % (CORE_ZIP_MAX >> 20))
+            try:
+                fd = os.open("/proc/self/fd/%d" % pfd, os.O_RDONLY | os.O_CLOEXEC)
+            except OSError as error:
+                raise Refused("cannot read the file: %s" % (error.strerror or error))
+        finally:
+            os.close(pfd)
+    st2 = os.fstat(fd)
+    if (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino) or not stat.S_ISREG(st2.st_mode):
+        os.close(fd)
+        raise Refused("the file changed while it was opened")
+    return fd
+
+
+def free_bytes(path):
+    v = os.statvfs(path)
+    return v.f_bavail * v.f_frsize
+
+
+@contextlib.contextmanager
+def stage_lock():
+    """One stage at a time. What a previous stage left behind (.stage-*) is
+    removed under the lock: nothing else can be writing it."""
+    lfd = os.open(os.path.join(CORE_DIR, STAGE_LOCK),
+                  os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Busy("another core stage is running; try again when it is done")
+        for name in os.listdir(CORE_DIR):
+            if name.startswith(".stage-"):
+                shutil.rmtree(os.path.join(CORE_DIR, name), ignore_errors=True)
+        yield
+    finally:
+        os.close(lfd)
+
+
+def core_stage(version, source):
+    expected = pinned_sum(version)
+    ids = caller_ids()
+    fd = open_caller_file(source, ids)
+    try:
+        gid = core_gid()
+        core_dirs()
+        with stage_lock():
+            size_in = os.fstat(fd).st_size
+            if free_bytes(CORE_DIR) < size_in + STAGE_RESERVE:
+                raise NoSpace("not enough free space in %s for the archive (%d MiB needed)"
+                              % (CORE_DIR, (size_in + STAGE_RESERVE) >> 20))
+            stage = tempfile.mkdtemp(prefix=".stage-", dir=CORE_DIR)
+            try:
+                staged(version, expected, fd, stage, gid)
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
+    finally:
+        os.close(fd)
+    print("core: xray %s staged in %s (sha256 %s), cap_net_admin,cap_net_bind_service=ep, "
+          "root:%s 0750" % (version, os.path.join(CORE_DIR, version), expected[:16], CORE_GROUP))
+    return 0
+
+
+def staged(version, expected, fd, stage, gid):
+    zip_path = os.path.join(stage, "core.zip")
+    h = hashlib.sha256()
+    size = 0
+    with open(zip_path, "wb") as out:
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > CORE_ZIP_MAX:
+                raise Refused("larger than %d MiB" % (CORE_ZIP_MAX >> 20))
+            h.update(chunk)
+            out.write(chunk)
+    if h.hexdigest() != expected:
+        # The computed sum is not printed: it would describe a file, not the core.
+        raise Mismatch("the file is not the pinned %s of xray %s (SHA-256 %s)"
+                       % (CORE_ASSET, version, expected))
+    binary = os.path.join(stage, "xray")
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            info = zf.getinfo(CORE_MEMBER)
+            if info.file_size > CORE_BIN_MAX:
+                raise Refused("the core in the archive is too large")
+            if free_bytes(CORE_DIR) < info.file_size + STAGE_RESERVE:
+                raise NoSpace("not enough free space in %s for the core (%d MiB needed)"
+                              % (CORE_DIR, (info.file_size + STAGE_RESERVE) >> 20))
+            with zf.open(info) as src, open(binary, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1 << 20)
+    except (KeyError, zipfile.BadZipFile) as error:
+        raise Refused("bad archive: %s" % error)
+    os.unlink(zip_path)
+    bfd = os.open(binary, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if os.read(bfd, 4) != b"\x7fELF":
+            raise Refused("the core in the archive is not an ELF binary")
+        seal_core(bfd, gid)
+    finally:
+        os.close(bfd)
+    os.chown(stage, 0, gid)
+    os.chmod(stage, 0o750)
+    final = os.path.join(CORE_DIR, version)
+    # The same version again (a repeated update) has the same bytes, since
+    # both copies match the same pinned sum: one the tunnel may be running
+    # stays as it is, any other is replaced.
+    if os.path.lexists(final) and not in_use(version):
+        shutil.rmtree(final)
+    if not os.path.lexists(final):
+        os.rename(stage, final)
+    else:
+        fd2 = os.open(os.path.join(final, "xray"), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            seal_core(fd2, gid)
+        finally:
+            os.close(fd2)
+        os.chown(final, 0, gid)
+        os.chmod(final, 0o750)
+
+
+LINKS = ("current", "previous", "older")
+
+
+def link_target(name):
+    try:
+        target = os.readlink(os.path.join(CORE_DIR, name))
+    except OSError:
+        return None
+    return target if VERSION_RE.fullmatch(target) else None
+
+
+def in_use(version):
+    return version in (link_target(n) for n in LINKS)
+
+
+def set_link(name, version):
+    tmp = os.path.join(CORE_DIR, ".%s.tmp" % name)
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(version, tmp)
+    os.replace(tmp, os.path.join(CORE_DIR, name))
+
+
+def drop_link(name):
+    path = os.path.join(CORE_DIR, name)
+    if os.path.lexists(path):
+        os.unlink(path)
+
+
+def check_staged(version):
+    binary = os.path.join(CORE_DIR, version, "xray")
+    try:
+        st = os.lstat(binary)
+    except OSError:
+        raise Refused("xray %s is not staged" % version)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        raise Refused("xray %s is not a root-owned staged core" % version)
+
+
+def prune():
+    """Delete every version no link points to, and links to versions that are gone."""
+    keep = {link_target(n) for n in LINKS} - {None}
+    for name in os.listdir(CORE_DIR):
+        if VERSION_RE.fullmatch(name) and name not in keep:
+            shutil.rmtree(os.path.join(CORE_DIR, name), ignore_errors=True)
+    for n in LINKS:
+        t = link_target(n)
+        if os.path.lexists(os.path.join(CORE_DIR, n)) and (not t or not os.path.isdir(os.path.join(CORE_DIR, t))):
+            drop_link(n)
+    # Stages left by a stage that was killed: only when no stage is running.
+    lfd = os.open(os.path.join(CORE_DIR, STAGE_LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for name in os.listdir(CORE_DIR):
+            if name.startswith(".stage-"):
+                shutil.rmtree(os.path.join(CORE_DIR, name), ignore_errors=True)
+    except BlockingIOError:
+        pass
+    finally:
+        os.close(lfd)
+
+
+def core_activate(version):
+    core_dirs()
+    check_staged(version)
+    old, old_prev = link_target("current"), link_target("previous")
+    set_link("current", version)
+    if old and old != version:
+        set_link("previous", old)
+        # The one before stays until the next activation: if this version
+        # fails, `core rollback` makes `previous` point to it again.
+        if old_prev and old_prev not in (version, old):
+            set_link("older", old_prev)
+        else:
+            drop_link("older")
+    if link_target("previous") == version:
+        drop_link("previous")
+    if link_target("older") in (version, link_target("previous")):
+        drop_link("older")
+    prune()
+    print("core: xray %s is active (previous: %s)" % (version, link_target("previous") or "none"))
+    return 0
+
+
+def core_rollback(version):
+    """Back from a failed activation to VERSION (core/previous)."""
+    core_dirs()
+    if link_target("previous") != version:
+        raise Refused("xray %s is not the previous version (previous: %s)"
+                      % (version, link_target("previous") or "none"))
+    check_staged(version)
+    failed, older = link_target("current"), link_target("older")
+    set_link("current", version)
+    if older and older != version and os.path.isdir(os.path.join(CORE_DIR, older)):
+        set_link("previous", older)
+    else:
+        drop_link("previous")
+    drop_link("older")
+    prune()
+    print("core: back to xray %s (previous: %s); xray %s removed"
+          % (version, link_target("previous") or "none", failed or "none"))
+    return 0
+
+
+def core(argv):
+    if len(argv) == 3 and argv[0] == "stage":
+        return core_stage(check_version(argv[1]), argv[2])
+    if len(argv) == 2 and argv[0] == "activate":
+        return core_activate(check_version(argv[1]))
+    if len(argv) == 2 and argv[0] == "rollback":
+        return core_rollback(check_version(argv[1]))
+    raise Refused("core stage VERSION FILE | core activate VERSION | core rollback VERSION")
+
+
+# ---------------------------------------------------------------- reset
+
+def reset(argv):
+    """Everything back as before the package: run by pacman before removal."""
+    if argv:
+        raise Refused("reset takes no arguments")
+    route("down")
+    if table_state() != "off":
+        run(["nft", "delete", "table", "inet", NFT_TABLE])
+    print("killswitch: %s" % table_state())
+    if os.path.lexists(DNS_DIR):
+        for name in sorted(os.listdir(dns_dir())):
+            uuid = name[:-5] if name.endswith(".json") else ""
+            if not UUID_RE.fullmatch(uuid):
+                continue
+            try:
+                snap = load_snapshot(uuid)
+                if snap:
+                    dns_restore(snap)
+            except (Refused, OSError, subprocess.SubprocessError) as error:
+                print("dns %s: %s" % (uuid, error))
+    # The core goes with it: its capabilities are on files in this directory.
+    shutil.rmtree(STATE_DIR, ignore_errors=True)
+    print("reset: done")
+    return 0
+
+
+# ---------------------------------------------------------------- entry
+
+def main(argv):
+    if os.geteuid() != 0:
+        print("xray-omarchy-helper: must run as root (sudo -n %s ...)" % os.path.abspath(__file__), file=sys.stderr)
+        return 2
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    action, rest = argv[0], argv[1:]
+    try:
+        if action == "route" and len(rest) == 1 and rest[0] in ("up", "down"):
+            return route(rest[0])
+        if action == "killswitch":
+            return killswitch(rest)
+        if action == "dns":
+            return dns(rest)
+        if action == "core":
+            return core(rest)
+        if action == "reset":
+            return reset(rest)
+        raise Refused("unknown action: %s" % first_line(" ".join(argv), 100))
+    except Mismatch as error:
+        print("xray-omarchy-helper: %s" % error, file=sys.stderr)
+        return 3
+    except Foreign as error:
+        print("xray-omarchy-helper: %s" % error, file=sys.stderr)
+        return 4
+    except Busy as error:
+        print("xray-omarchy-helper: %s" % error, file=sys.stderr)
+        return 5
+    except NoSpace as error:
+        print("xray-omarchy-helper: %s" % error, file=sys.stderr)
+        return 6
+    except Refused as error:
+        print("xray-omarchy-helper: %s" % error, file=sys.stderr)
+        return 2
+    except (OSError, subprocess.SubprocessError) as error:
+        print("xray-omarchy-helper: %s" % first_line(str(error)), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

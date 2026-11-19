@@ -1,0 +1,2984 @@
+#!/usr/bin/env python3
+"""xray-omarchy: one xray core for the tunnel (subscriptions, config, TUN, killswitch, status).
+
+The xray core holds the TUN device (xray-omarchy0), the routing (local and
+direct zones past the tunnel), DNS on 127.0.0.1:53 and the node choice. This
+program builds the config, sets the routes, the killswitch (nftables table
+inet xray-omarchy) and the system DNS through the root helper
+/usr/lib/xray-omarchy/xray-omarchy-helper (sudo without a password only for
+it), and gives the bar plugin the whole state as one JSON.
+
+Nothing about the machine is hard-coded: the physical interface, the
+NetworkManager connection and the network's DNS are detected
+(~/.local/state/xray-omarchy/network.json); the rest are optional settings in
+~/.config/xray-omarchy/settings.json (lan_domains, direct_geo, local_nets, lan_dns).
+
+The xray core is the official XTLS release. `core update` downloads it as the
+user; the root helper copies it into /var/lib/xray-omarchy/core, installs it only
+when its SHA-256 is one this package pins (/usr/share/xray-omarchy/core-sums.json)
+and gives it CAP_NET_ADMIN and CAP_NET_BIND_SERVICE. geoip.dat and geosite.dat
+come from the distribution (/usr/share/v2ray, packages v2ray-geoip and
+v2ray-domain-list-community).
+
+Secrets: subscriptions, their cache and the built config are 0600 files.
+The connection log (where sites went) lives only in tmpfs
+$XDG_RUNTIME_DIR/xray-omarchy and disappears when the core stops.
+
+XRAY_OMARCHY_* variables (directories, unit, API ports, xray path) are for a
+test stand only: with them the commands work on a copy and leave the live core alone.
+"""
+import argparse
+import base64
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse as up
+import urllib.request
+
+
+def _env(name, default):
+    return os.environ.get(name) or default
+
+
+NAME = "xray-omarchy"
+VERSION = "0.6.3"
+HOME = os.path.expanduser("~")
+CONF_DIR = _env("XRAY_OMARCHY_CONF_DIR", os.path.join(HOME, ".config", NAME))
+STATE_DIR = _env("XRAY_OMARCHY_STATE_DIR", os.path.join(HOME, ".local/state", NAME))
+# geoip.dat / geosite.dat for the core (XRAY_LOCATION_ASSET): links to the
+# distribution's copies (packages v2ray-geoip, v2ray-domain-list-community,
+# kept current by pacman).
+ASSET_DIR = _env("XRAY_OMARCHY_ASSET_DIR", os.path.join(HOME, ".local/share", NAME))
+SYSTEM_GEO_DIR = "/usr/share/v2ray"
+GEO_FILES = ("geoip.dat", "geosite.dat")
+# The core lives in root's directory: only the helper writes there, and only a
+# release whose SHA-256 the package pins. current/ and previous/ are links to
+# version directories.
+CORE_DIR = "/var/lib/xray-omarchy/core"
+XRAY = _env("XRAY_OMARCHY_XRAY", os.path.join(CORE_DIR, "current", "xray"))
+XRAY_PREV = _env("XRAY_OMARCHY_XRAY_PREV", os.path.join(CORE_DIR, "previous", "xray"))
+CORE_SUMS = _env("XRAY_OMARCHY_CORE_SUMS", "/usr/share/xray-omarchy/core-sums.json")
+# Downloads of pinned releases, kept between attempts (checked again each time).
+CORE_CACHE = _env("XRAY_OMARCHY_CORE_CACHE", os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), NAME, "core"))
+RUN_DIR = _env("XRAY_OMARCHY_RUN_DIR", os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()), "xray-omarchy"))
+
+SUBS_FILE = os.path.join(CONF_DIR, "subscriptions.json")
+RULES_FILE = os.path.join(CONF_DIR, "rules.json")
+SETTINGS_FILE = os.path.join(CONF_DIR, "settings.json")
+SUBS_CACHE = os.path.join(STATE_DIR, "subs")
+SELECTION_FILE = os.path.join(STATE_DIR, "selection.json")
+CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
+TRAFFIC_FILE = os.path.join(STATE_DIR, "traffic.json")
+EXIT_FILE = os.path.join(STATE_DIR, "exit.json")
+CORE_STATE = os.path.join(STATE_DIR, "core.json")
+WATCH_DAILY = os.path.join(STATE_DIR, "watch-daily.json")
+LOG_FILE = os.path.join(STATE_DIR, "xray-omarchy.log")
+ACCESS_LOG = os.path.join(RUN_DIR, "access.log")
+ERROR_LOG = os.path.join(RUN_DIR, "error.log")
+# Observatory the running core was started with (written by `net up`).
+STARTED_FILE = os.path.join(RUN_DIR, "started.json")
+# Why `net up` failed last, or "" when it set the routes. Next to the unit's
+# runtime directory, not in it: systemd removes that directory each time the
+# unit stops, and a failed `net up` stops it (then restarts it).
+NET_FILE = RUN_DIR.rstrip("/") + ".net.json"
+# A `net up` failure older than this is history, not the state now: the unit
+# retries at most every 30 s (RestartMaxDelaySec).
+NET_FAIL_FRESH = 120
+WATCH_FILE = os.path.join(RUN_DIR, "watch.json")
+
+UNIT = _env("XRAY_OMARCHY_UNIT", "xray-omarchy.service")
+DEV = "xray-omarchy0"
+GATEWAY = "172.19.0.1/30"
+# Mark on the core's outgoing sockets: ip rule lets them past the TUN by it,
+# and the killswitch (nftables, the helper) lets them out.
+MARK = 500
+TABLE = 7000
+PREF_MAIN = 9100
+PREF_TUN = 9110
+API = _env("XRAY_OMARCHY_API", "127.0.0.1:10085")
+METRICS = _env("XRAY_OMARCHY_METRICS", "http://127.0.0.1:10086/debug/vars")
+DEFAULT_UA = "v2rayN/7.13"
+PROBE_URL = "https://www.gstatic.com/generate_204"
+# Stand only: the core health probe goes through this proxy and skips the
+# TUN/ip rule checks (a stand core has no TUN).
+CORE_PROXY = os.environ.get("XRAY_OMARCHY_CORE_PROXY")
+RELEASE_API = _env("XRAY_OMARCHY_RELEASE_API", "https://api.github.com/repos/XTLS/Xray-core/releases/latest")
+# The only place a core is downloaded from; the release API's links are checked against it.
+RELEASE_DOWNLOAD = "https://github.com/XTLS/Xray-core/releases/download/"
+RELEASE_ASSET = "Xray-linux-64.zip"
+TAG_RE = re.compile(r"v?([0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4})")
+# Download limits: the core's zip is ~16 MB, a subscription a few hundred KB.
+CORE_ZIP_MAX = 64 << 20
+SUB_MAX = 8 << 20
+API_MAX = 1 << 20
+CORE_UPDATE_UNIT = "xray-omarchy-core-update"
+
+HELPER = _env("XRAY_OMARCHY_HELPER", "/usr/lib/xray-omarchy/xray-omarchy-helper")
+# The helper's snapshots of each connection's own DNS settings, taken before
+# `dns on` points it to the core and put back by `dns off` (world-readable).
+DNS_SNAPSHOTS = _env("XRAY_OMARCHY_DNS_SNAPSHOTS", "/var/lib/xray-omarchy/dns")
+NETWORK_FILE = os.path.join(STATE_DIR, "network.json")
+
+DEFAULT_SETTINGS = {
+    "notify": True,
+    # Names only the network's own DNS knows; DHCP search domains are added to them.
+    "lan_domains": ["lan", "local"],
+    # Past the tunnel: geosite lists, geoip countries and whole zones. Their names
+    # are resolved by the network's DNS too, so a company domain in such a zone
+    # keeps its internal address (split DNS, no hairpin needed). Empty by
+    # default: everything goes through the tunnel; presets (PRESETS) fill it.
+    "direct_geo": {"geosite": [], "geoip": [], "domains": []},
+    "local_nets": ["10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"],
+    # DNS server of the network; null — taken from DHCP (or the connection's static DNS).
+    "lan_dns": None,
+}
+# Tailscale's control plane is resolved by the network DNS: a dead tunnel does not cut remote access.
+BYPASS_DNS_DOMAINS = ["tailscale.com", "tailscale.io"]
+# Never the physical uplink: tunnels, bridges, containers, VMs. Any TUN/TAP
+# device (other VPN clients, whatever they call it) is caught by tun_flags in
+# virtual_iface(), so names of particular clients are not listed here.
+VIRTUAL_PREFIXES = ("lo", "tailscale", "wg", "docker", "br-", "veth", "virbr", "vnet", "tun", "tap",
+                    "zt", "lxc", "lxd", "incus", "podman", "cni", "flannel", "vmnet", "vboxnet")
+# Ready-made direct lists the panel offers as one switch each.
+PRESETS = {
+    "russia": {"geosite": ["category-ru"], "geoip": ["ru"], "domains": ["ru", "su", "xn--p1ai"]},
+}
+SERVICE_PROTOCOLS = {"freedom", "blackhole", "dns", "loopback"}
+# Fallback node: the core probes faster so a dead primary is noticed in under a minute.
+FALLBACK_PROBE = "25s"
+
+
+# ---------------------------------------------------------------- utilities
+
+def log(msg):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG_FILE, "a", encoding="utf8") as fh:
+        fh.write("%s %s\n" % (time.strftime("%F %T"), msg))
+
+
+def say(msg):
+    print(msg)
+    log(msg)
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_private(path, data, binary=False):
+    """Write through a temporary file with mode 0600: an interruption never leaves half a file."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb" if binary else "w", **({} if binary else {"encoding": "utf8"})) as fh:
+        fh.write(data)
+    os.replace(tmp, path)
+
+
+def write_json(path, obj):
+    write_private(path, json.dumps(obj, ensure_ascii=False, indent=1))
+
+
+def run(cmd, check=False, timeout=30):
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
+
+
+def helper(*args):
+    """Root actions go only through the helper; sudoers allows exactly this path."""
+    try:
+        return run(["sudo", "-n", HELPER, *args])
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(args, 1, "", str(error))
+
+
+def short_hash(text):
+    return hashlib.sha1(text.encode("utf8")).hexdigest()[:10]
+
+
+def b64decode_loose(text):
+    text = text.strip().replace("\n", "").replace("\r", "")
+    text += "=" * (-len(text) % 4)
+    try:
+        return base64.urlsafe_b64decode(text.replace("+", "-").replace("/", "_")).decode("utf8")
+    except Exception:
+        return None
+
+
+def finish(args, ok, code, detail, text):
+    """A command's outcome: a sentence for the terminal, and for the panel (--json) a last
+    line {ok, code, detail}."""
+    say(text)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "code": code, "detail": detail}, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- settings and network
+
+ZONE_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+GEO_RE = re.compile(r"[a-z0-9][a-z0-9!@_.-]{0,99}")
+
+
+def _clean_list(value, pattern, default):
+    if not isinstance(value, list):
+        return list(default)
+    out = []
+    for item in value:
+        item = item.strip().lower().rstrip(".") if isinstance(item, str) else ""
+        if pattern.fullmatch(item) and item not in out:
+            out.append(item)
+    return out
+
+
+# What may count as a local network (the helper refuses anything else): private
+# (RFC 1918), CGNAT, link-local and ULA. A wider one would open the killswitch.
+ALLOWED_LOCAL_NETS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16",
+    "fc00::/7", "fe80::/10")]
+
+
+def local_net(net):
+    return any(net.version == a.version and net.subnet_of(a) for a in ALLOWED_LOCAL_NETS)
+
+
+def in_nets(addr, nets):
+    a = ipaddress.ip_address(addr)
+    return any(a.version == n.version and a in n for n in (ipaddress.ip_network(x) for x in nets))
+
+
+def _clean_nets(value, default, warnings=None):
+    """local_nets from settings.json. One value that is not a local network
+    (0.0.0.0/0, a public net, garbage) and the whole list falls back to the
+    default, with a warning in status: half a list is not what the user meant."""
+    if value is None:
+        return list(default)
+    out, bad = [], []
+    for item in value if isinstance(value, list) else [value]:
+        text = str(item).strip()
+        net = None
+        if re.fullmatch(r"[0-9a-fA-F:.]{2,45}(?:/[0-9]{1,3})?", text):
+            try:
+                net = ipaddress.ip_network(text, strict=False)
+            except ValueError:
+                net = None
+        if net is None or not local_net(net):
+            bad.append(text[:60])
+        elif str(net) not in out:
+            out.append(str(net))
+    if bad or not out:
+        if warnings is not None:
+            warnings.append("settings.json local_nets: %s %s not a local network (only private, CGNAT, "
+                            "link-local and ULA ranges); the defaults are used" % (
+                                ", ".join(bad) or "(empty)", "is" if len(bad) == 1 else "are"))
+        return list(default)
+    return out
+
+
+IP_CHARS_RE = re.compile(r"[0-9a-fA-F:.]{2,45}")
+
+
+def _clean_ip(value):
+    """An address, or None. Nothing but hex digits, dots and colons: an IPv6
+    zone (fe80::1%eth0) and anything after it are refused, since ipaddress
+    keeps the zone text as it was given."""
+    text = str(value).strip()
+    if not IP_CHARS_RE.fullmatch(text):
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return None
+
+
+def load_settings():
+    """settings.json over the defaults; a malformed value falls back to its default.
+    "warnings": what was replaced (shown by status)."""
+    raw = read_json(SETTINGS_FILE, {})
+    warnings = []
+    raw = raw if isinstance(raw, dict) else {}
+    d = DEFAULT_SETTINGS
+    geo = raw.get("direct_geo") if isinstance(raw.get("direct_geo"), dict) else d["direct_geo"]
+    lan_dns = raw.get("lan_dns")
+    if isinstance(lan_dns, str):
+        lan_dns = [lan_dns]
+    lan_dns = [a for a in (_clean_ip(x) for x in lan_dns or []) if a] if isinstance(lan_dns, list) else []
+    return {
+        "notify": bool(raw.get("notify", d["notify"])),
+        "lan_domains": _clean_list(raw.get("lan_domains", d["lan_domains"]), ZONE_RE, d["lan_domains"]),
+        "direct_geo": {
+            "geosite": _clean_list(geo.get("geosite", d["direct_geo"]["geosite"]), GEO_RE,
+                                   d["direct_geo"]["geosite"]),
+            "geoip": _clean_list(geo.get("geoip", d["direct_geo"]["geoip"]), GEO_RE, d["direct_geo"]["geoip"]),
+            "domains": _clean_list(geo.get("domains", d["direct_geo"]["domains"]), ZONE_RE,
+                                   d["direct_geo"]["domains"]),
+        },
+        "local_nets": _clean_nets(raw.get("local_nets"), d["local_nets"], warnings),
+        "lan_dns": lan_dns,
+        "warnings": warnings,
+    }
+
+
+def direct_domains(st):
+    geo = st["direct_geo"]
+    return ["geosite:" + g for g in geo["geosite"]] + ["domain:" + z for z in geo["domains"]]
+
+
+def lan_dns_domains(st, net):
+    """What the network's DNS resolves: the direct zones, internal names, the DHCP search domains, Tailscale."""
+    zones = []
+    for z in st["lan_domains"] + list((net or {}).get("search") or []) + BYPASS_DNS_DOMAINS:
+        if z not in zones:
+            zones.append(z)
+    return direct_domains(st) + ["domain:" + z for z in zones]
+
+
+def nm_fields(line):
+    """A `nmcli -t` line: fields split by ":", with "\\:" and "\\\\" inside a field."""
+    out, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return out
+
+
+def virtual_iface(dev):
+    if dev == DEV or dev.startswith(VIRTUAL_PREFIXES):
+        return True
+    base = "/sys/class/net/" + dev
+    if os.path.exists(base + "/tun_flags") or os.path.isdir(base + "/bridge"):
+        return True
+    try:
+        with open(base + "/uevent", encoding="utf8") as fh:
+            uevent = fh.read()
+    except OSError:
+        return False
+    return "DEVTYPE=wireguard" in uevent or "DEVTYPE=bridge" in uevent
+
+
+def nmcli(*args):
+    try:
+        return run(["nmcli", *args], timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def detect_iface():
+    """The device of the default route in main (not the tunnel); without one, the first
+    connected ethernet/wifi device according to NetworkManager."""
+    try:
+        routes = json.loads(run(["ip", "-j", "route", "show", "default", "table", "main"]).stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        routes = []
+    for r in sorted(routes, key=lambda r: r.get("metric", 0)):
+        dev = r.get("dev")
+        if dev and not virtual_iface(dev):
+            return dev
+    for line in nmcli("-t", "-f", "DEVICE,TYPE,STATE", "device").splitlines():
+        f = nm_fields(line)
+        if len(f) >= 3 and f[1] in ("ethernet", "wifi") and f[2] == "connected" and not virtual_iface(f[0]):
+            return f[0]
+    return None
+
+
+def own_dns_settings(uuid):
+    """(ipv4.dns, ipv4.ignore-auto-dns) of the connection as its owner set them:
+    from the helper's snapshot while the tunnel has them pointed to the core
+    (the connection itself says 127.0.0.1 then), else from the connection."""
+    snap = read_json(os.path.join(DNS_SNAPSHOTS, uuid + ".json"), None)
+    props = snap.get("props") if isinstance(snap, dict) else None
+    if isinstance(props, dict) and isinstance(props.get("ipv4.dns", ""), str):
+        return props.get("ipv4.dns", ""), props.get("ipv4.ignore-auto-dns", "no")
+    out = nmcli("--escape", "no", "-g", "ipv4.dns,ipv4.ignore-auto-dns", "connection", "show", "uuid", uuid)
+    lines = out.splitlines()
+    return (lines[0] if lines else ""), (lines[1].strip() if len(lines) > 1 else "no")
+
+
+def detect_network():
+    """The network now: (dict, "") or (None, reason). The network's DNS is the
+    one the connection's own settings give, as NetworkManager applies them
+    (and as `dns off` puts them back): its static servers, then the ones from
+    DHCP unless it ignores those. Never IP4.DNS: after `dns on` that already
+    says 127.0.0.1."""
+    iface = detect_iface()
+    if not iface:
+        return None, "no default route through a physical interface"
+    conn = None
+    for line in nmcli("-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show", "--active").splitlines():
+        f = nm_fields(line)
+        if len(f) >= 4 and f[3] == iface:
+            conn = {"name": f[0], "uuid": f[1].lower(), "type": f[2]}
+            break
+    if not conn:
+        return None, "no active NetworkManager connection on %s" % iface
+    ssid = ""
+    if conn["type"] == "802-11-wireless":
+        ssid = nmcli("-g", "802-11-wireless.ssid", "connection", "show", "uuid", conn["uuid"]).strip()
+    dhcp = {}
+    for line in nmcli("-t", "-f", "DHCP4", "device", "show", iface).splitlines():
+        key, sep, value = line.partition(":")[2].partition(" = ")
+        if sep:
+            dhcp[key.strip()] = value.strip()
+
+    def usable(addrs):
+        out = []
+        for a in addrs:
+            a = _clean_ip(a)
+            if a and not ipaddress.ip_address(a).is_loopback and a not in out:
+                out.append(a)
+        return out
+
+    static_text, ignore_auto = own_dns_settings(conn["uuid"])
+    static = usable(re.split(r"[,\s]+", static_text.strip()))
+    auto = [] if ignore_auto == "yes" else usable(dhcp.get("domain_name_servers", "").split())
+    lan_dns = usable(static + auto)
+    source = "static+dhcp" if static and auto else ("static" if static else "dhcp")
+    # Renewals go to the DHCP server by unicast: the killswitch lets exactly it through.
+    dhcp_server = _clean_ip(dhcp.get("dhcp_server_identifier", ""))
+    if dhcp_server and ipaddress.ip_address(dhcp_server).version != 4:
+        dhcp_server = None
+    search = []
+    for z in (dhcp.get("domain_search", "") + " " + dhcp.get("domain_name", "")).split():
+        z = z.lower().rstrip(".")
+        if ZONE_RE.fullmatch(z) and z not in search:
+            search.append(z)
+    return {"iface": iface, "connection": conn["name"], "uuid": conn["uuid"], "ssid": ssid,
+            "key": conn["uuid"] + "|" + ssid, "lan_dns": lan_dns, "search": search,
+            "dhcp_server": dhcp_server, "source": source if lan_dns else None}, ""
+
+
+NETWORK_KEYS = ("iface", "connection", "uuid", "ssid", "key", "lan_dns", "search", "dhcp_server",
+                "source", "time")
+_net_error = {"text": ""}
+
+
+def network(refresh=False):
+    """The network the machine goes out through. Without refresh: the remembered one (cheap,
+    for status). With refresh: detect it again and remember it; a network DNS that is not
+    visible right now is taken from what was remembered for the same network. None: cannot tell."""
+    saved = read_json(NETWORK_FILE, {})
+    saved = saved if isinstance(saved, dict) else {}
+    if not refresh and saved.get("iface"):
+        net = saved
+    else:
+        net, why = detect_network()
+        _net_error["text"] = why
+        if not net:
+            if not saved.get("iface"):
+                return None
+            net = dict(saved, source="saved")
+        else:
+            if not net["lan_dns"] and saved.get("key") == net["key"] and saved.get("lan_dns"):
+                net.update(lan_dns=saved["lan_dns"], source="saved")
+            net["time"] = int(time.time())
+            if any(saved.get(k) != net.get(k) for k in NETWORK_KEYS if k != "time") \
+                    or time.time() - saved.get("time", 0) > 86400:
+                if saved.get("key") and saved.get("key") != net["key"]:
+                    log("network changed: %s (%s) -> %s (%s)" % (saved.get("connection"), saved.get("iface"),
+                                                                net["connection"], net["iface"]))
+                merged = dict(saved)
+                merged.update({k: net.get(k) for k in NETWORK_KEYS})
+                write_json(NETWORK_FILE, merged)
+    net = dict(net)
+    override = load_settings()["lan_dns"]
+    if override:
+        net.update(lan_dns=override, source="settings")
+    return net
+
+
+DNS_SOURCE_TEXT = {"static": "static", "dhcp": "from DHCP", "static+dhcp": "static, then DHCP",
+                   "saved": "as last seen", "settings": "from settings.json"}
+
+
+def network_status():
+    net = network() or {}
+    return {"iface": net.get("iface"), "connection": net.get("connection"),
+            "lan_dns": (net.get("lan_dns") or [None])[0], "source": net.get("source")}
+
+
+def network_error():
+    return _net_error["text"] or "cannot detect the network"
+
+
+# ---------------------------------------------------------------- subscriptions
+
+def load_subs():
+    return read_json(SUBS_FILE, [])
+
+
+def sub_id(sub):
+    return short_hash(sub["url"])
+
+
+def read_limited(resp, limit):
+    """The body of a response, refused when it is larger than limit bytes."""
+    body = resp.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError("response larger than %d MiB" % (limit >> 20) if limit >= 1 << 20
+                         else "response larger than %d bytes" % limit)
+    return body
+
+
+class NoDowngrade(urllib.request.HTTPRedirectHandler):
+    """Redirects only to https: an https subscription never ends up fetched in
+    plain text (urllib follows https -> http by default)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if up.urlsplit(newurl).scheme != "https":
+            raise urllib.error.HTTPError(newurl, code, "redirect to a non-https link refused (insecure_url)",
+                                         headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def insecure_sub(sub):
+    """A plain-http subscription not explicitly allowed (sub add --allow-http)."""
+    return up.urlsplit(sub["url"]).scheme != "https" and not sub.get("allow_http")
+
+
+def fetch_sub(sub):
+    if insecure_sub(sub):
+        raise ValueError("insecure_url: the link is plain http; add it again with --allow-http to accept that")
+    req = urllib.request.Request(sub["url"], headers={"User-Agent": sub.get("ua") or DEFAULT_UA})
+    opener = urllib.request.build_opener() if sub.get("allow_http") else urllib.request.build_opener(NoDowngrade)
+    with opener.open(req, timeout=30) as resp:
+        body = read_limited(resp, SUB_MAX)
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+    return body, headers
+
+
+def parse_userinfo(value):
+    out = {}
+    for part in (value or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            try:
+                out[k.strip()] = int(float(v.strip()))
+            except ValueError:
+                pass
+    return out
+
+
+def profile_title(value):
+    if not value:
+        return None
+    if value.startswith("base64:"):
+        return b64decode_loose(value[7:])
+    return value
+
+
+def cmd_update(args):
+    subs = load_subs()
+    if not subs:
+        say("no subscriptions: xray-omarchy sub add NAME URL")
+        if args.json:
+            print("[]")
+        return 0
+    selection = read_json(SELECTION_FILE, {})
+    active_changed = False
+    failed = 0
+    results = []
+    for sub in subs:
+        if args.name and sub["name"] != args.name:
+            continue
+        sid = sub_id(sub)
+        try:
+            body, headers = fetch_sub(sub)
+            nodes, skipped = parse_subscription(body, sid)
+            if not nodes:
+                raise ValueError("no usable nodes in response (skipped: %s)" % (
+                    ", ".join("%s%s ×%d" % (i["scheme"] + " " if i["scheme"] else "", i["code"], i["count"])
+                              for i in skipped) or "-"))
+        except Exception as error:
+            failed += 1
+            results.append({"name": sub["name"], "ok": False, "error": str(error)[:200]})
+            if not args.json:
+                say("%s: not updated (%s), keeping the previous copy" % (sub["name"], error))
+            else:
+                log("%s: not updated (%s)" % (sub["name"], error))
+            continue
+        raw_path = os.path.join(SUBS_CACHE, sid + ".raw")
+        old = None
+        if os.path.exists(raw_path):
+            with open(raw_path, "rb") as fh:
+                old = fh.read()
+        write_private(raw_path, body, binary=True)
+        meta = {
+            "name": sub["name"],
+            "updated": int(time.time()),
+            "userinfo": parse_userinfo(headers.get("subscription-userinfo")),
+            "title": profile_title(headers.get("profile-title")),
+            "count": len(nodes),
+            "skipped": skipped,
+        }
+        write_json(os.path.join(SUBS_CACHE, sid + ".meta.json"), meta)
+        results.append({"name": sub["name"], "ok": True, "count": len(nodes), "skipped": skipped})
+        line = "%s: %d nodes%s" % (sub["name"], len(nodes),
+                                   ", skipped: " + ", ".join(skip_text(skipped)) if skipped else "")
+        say(line) if not args.json else log(line)
+        if old != body and active_sub_id(selection, subs) == sid:
+            active_changed = True
+    if args.apply and active_changed and service_active():
+        say("active subscription changed: rebuilding the config and restarting the core")
+        restart_core()
+    if args.json:
+        print(json.dumps(results, ensure_ascii=False))
+    # Non-zero exit if any one failed to update: the panel and the timer must see it.
+    return 1 if failed else 0
+
+
+def cmd_sub(args):
+    subs = load_subs()
+    if args.action == "list":
+        selection = read_json(SELECTION_FILE, {})
+        active = active_sub_id(selection, subs)
+        for sub in subs:
+            meta = read_json(os.path.join(SUBS_CACHE, sub_id(sub) + ".meta.json"), {})
+            mark = "*" if sub_id(sub) == active else " "
+            print("%s %-20s nodes %-4s updated %s" % (
+                mark, sub["name"], meta.get("count", "-"),
+                time.strftime("%F %H:%M", time.localtime(meta["updated"])) if meta.get("updated") else "never"))
+        return 0
+    if args.action == "add":
+        if not args.name or not args.url:
+            return finish(args, False, "usage", "", "usage: xray-omarchy sub add NAME URL")
+        name = args.name.strip()
+        if not SUB_NAME_RE.fullmatch(name):
+            return finish(args, False, "invalid_name", "",
+                          "subscription name: 1-40 characters, no control characters, not starting with -")
+        url = args.url.strip()
+        parsed = up.urlsplit(url)
+        if parsed.scheme not in ("https", "http") or not parsed.hostname or any(c.isspace() for c in url):
+            return finish(args, False, "invalid_url", "", "subscription URL must be an http(s) link")
+        if parsed.scheme == "http" and not args.allow_http:
+            return finish(args, False, "insecure_url", "",
+                          "not added: the link is plain http — anyone on the way can read it and swap the "
+                          "nodes. Use https, or add it with --allow-http if you accept that")
+        exists = any(s["name"] == name for s in subs)
+        subs = [s for s in subs if s["name"] != name]
+        entry = {"name": name, "url": url}
+        if args.ua:
+            entry["ua"] = args.ua
+        if parsed.scheme == "http":
+            entry["allow_http"] = True
+            say("warning: %s is fetched over plain http: its nodes can be read and swapped on the way" % name)
+        subs.append(entry)
+        write_json(SUBS_FILE, subs)
+        return finish(args, True, "replaced" if exists else "", name,
+                      "subscription %s %s" % (name, "replaced" if exists else "added"))
+    if args.action == "rm":
+        left = [s for s in subs if s["name"] != args.name]
+        if len(left) == len(subs):
+            return finish(args, False, "not_found", args.name or "", "no subscription %s" % args.name)
+        write_json(SUBS_FILE, left)
+        return finish(args, True, "", args.name, "subscription %s removed" % args.name)
+    return 2
+
+
+# Shown in the panel and passed as one argv entry; never parsed as an option.
+SUB_NAME_RE = re.compile(r"(?!-)[^\x00-\x1f\x7f]{1,40}")
+
+
+# ---------------------------------------------------------------- parsing nodes
+
+class Unsupported(Exception):
+    """The node is understood, but it will not be connected; the argument is the reason code."""
+
+
+# Skip reasons go out as codes: the panel puts the labels on them, this is the terminal text.
+SKIP_TEXT = {
+    "insecure_tls": "TLS without certificate check",
+    "hy2_obfs": "hysteria2 with obfs",
+    "parse_error": "parse error",
+    "unsupported_scheme": "unsupported protocol",
+    "loopback_profile": "profiles with loopback",
+    "no_group": "profiles without a group",
+    "no_node": "profiles without a node",
+    "clash_format": "clash (yaml) format, a v2ray-format link is needed",
+}
+
+
+def add_skip(skipped, code, scheme=""):
+    skipped[(code, scheme)] = skipped.get((code, scheme), 0) + 1
+
+
+def skip_items(skipped):
+    return [{"code": c, "scheme": s, "count": n} for (c, s), n in skipped.items()]
+
+
+def skip_text(items):
+    out = []
+    for it in items or []:
+        if isinstance(it, str):  # a cache from an earlier version
+            out.append(it)
+            continue
+        text = SKIP_TEXT.get(it["code"], it["code"])
+        out.append("%s%s ×%d" % (it["scheme"] + ": " if it.get("scheme") else "", text, it["count"]))
+    return out
+
+
+def insecure_tls(q, tls):
+    """xray 26 dropped allowInsecure. Without a pinned certificate such a node
+    can be intercepted by swapping the certificate, so it is not connected."""
+    if q.get("allowInsecure") in ("1", "true") or q.get("insecure") in ("1", "true"):
+        if not tls.get("pinnedPeerCertSha256"):
+            raise Unsupported("insecure_tls")
+
+def stream_from_query(q, host):
+    net = (q.get("type") or "tcp").lower()
+    if net == "raw":
+        net = "tcp"
+    if net == "splithttp":
+        net = "xhttp"
+    security = (q.get("security") or "none").lower()
+    stream = {"network": net, "security": security}
+    sni = q.get("sni") or q.get("peer") or ""
+    fp = q.get("fp") or ""
+    alpn = [a for a in (q.get("alpn") or "").split(",") if a]
+    if security == "tls":
+        tls = {"serverName": sni or host}
+        if fp:
+            tls["fingerprint"] = fp
+        if alpn:
+            tls["alpn"] = alpn
+        if q.get("pcs"):
+            tls["pinnedPeerCertSha256"] = q["pcs"]
+        insecure_tls(q, tls)
+        stream["tlsSettings"] = tls
+    elif security == "reality":
+        reality = {"serverName": sni, "fingerprint": fp or "chrome",
+                   "publicKey": q.get("pbk", ""), "shortId": q.get("sid", "")}
+        if q.get("spx"):
+            reality["spiderX"] = q["spx"]
+        if q.get("pqv"):
+            reality["mldsa65Verify"] = q["pqv"]
+        stream["realitySettings"] = reality
+    path = q.get("path")
+    hhost = q.get("host")
+    if net == "ws":
+        stream["wsSettings"] = {"path": path or "/", **({"host": hhost} if hhost else {})}
+    elif net == "httpupgrade":
+        stream["httpupgradeSettings"] = {"path": path or "/", **({"host": hhost} if hhost else {})}
+    elif net == "grpc":
+        grpc = {"serviceName": q.get("serviceName", ""), "multiMode": q.get("mode") == "multi"}
+        if q.get("authority"):
+            grpc["authority"] = q["authority"]
+        stream["grpcSettings"] = grpc
+    elif net == "xhttp":
+        xh = {"path": path or "/", "mode": q.get("mode") or "auto"}
+        if hhost:
+            xh["host"] = hhost
+        if q.get("extra"):
+            try:
+                xh["extra"] = json.loads(q["extra"])
+            except ValueError:
+                pass
+        stream["xhttpSettings"] = xh
+    elif net == "tcp" and q.get("headerType") == "http":
+        stream["tcpSettings"] = {"header": {"type": "http", "request": {
+            "path": [path or "/"], "headers": {"Host": [hhost]} if hhost else {}}}}
+    elif net == "kcp":
+        stream["kcpSettings"] = {"header": {"type": q.get("headerType") or "none"},
+                                 **({"seed": q["seed"]} if q.get("seed") else {})}
+    return stream
+
+
+def parse_vless(link):
+    u = up.urlsplit(link)
+    q = dict(up.parse_qsl(u.query))
+    user = {"id": up.unquote(u.username or ""), "encryption": q.get("encryption") or "none"}
+    if q.get("flow"):
+        user["flow"] = q["flow"]
+    return {"protocol": "vless",
+            "settings": {"vnext": [{"address": u.hostname, "port": u.port, "users": [user]}]},
+            "streamSettings": stream_from_query(q, u.hostname)}
+
+
+def parse_trojan(link):
+    u = up.urlsplit(link)
+    q = dict(up.parse_qsl(u.query))
+    q.setdefault("security", "tls")
+    return {"protocol": "trojan",
+            "settings": {"servers": [{"address": u.hostname, "port": u.port,
+                                      "password": up.unquote(u.username or "")}]},
+            "streamSettings": stream_from_query(q, u.hostname)}
+
+
+def parse_ss(link):
+    body = link[5:].split("#", 1)[0]
+    if "@" not in body:
+        body = b64decode_loose(body.split("?", 1)[0]) or ""
+    userinfo, _, hostport = body.rpartition("@")
+    if ":" not in userinfo:
+        userinfo = b64decode_loose(up.unquote(userinfo)) or ""
+    method, _, password = userinfo.partition(":")
+    hostport = hostport.split("?", 1)[0].rstrip("/")
+    host, _, port = hostport.rpartition(":")
+    return {"protocol": "shadowsocks",
+            "settings": {"servers": [{"address": host.strip("[]"), "port": int(port),
+                                      "method": method, "password": password}]}}
+
+
+def parse_vmess(link):
+    data = json.loads(b64decode_loose(link[8:]) or "{}")
+    q = {"type": data.get("net") or "tcp", "security": "tls" if data.get("tls") == "tls" else "none",
+         "sni": data.get("sni") or data.get("host") or "", "fp": data.get("fp", ""),
+         "alpn": data.get("alpn", ""), "path": data.get("path", ""), "host": data.get("host", ""),
+         "headerType": data.get("type", ""), "serviceName": data.get("path", "")}
+    return data.get("ps", ""), {
+        "protocol": "vmess",
+        "settings": {"vnext": [{"address": data["add"], "port": int(data["port"]),
+                                "users": [{"id": data["id"], "alterId": int(data.get("aid") or 0),
+                                           "security": data.get("scy") or "auto"}]}]},
+        "streamSettings": stream_from_query(q, data["add"])}
+
+
+def parse_hysteria2(link):
+    u = up.urlsplit(link)
+    q = dict(up.parse_qsl(u.query))
+    auth = up.unquote(u.username or "")
+    if u.password:
+        auth += ":" + up.unquote(u.password)
+    tls = {"serverName": q.get("sni") or u.hostname, "alpn": ["h3"]}
+    if q.get("pinSHA256"):
+        tls["pinnedPeerCertSha256"] = q["pinSHA256"].replace(":", "").lower()
+    insecure_tls(q, tls)
+    if q.get("obfs"):
+        raise Unsupported("hy2_obfs")
+    return {"protocol": "hysteria",
+            "settings": {"version": 2, "address": u.hostname, "port": u.port},
+            "streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": tls,
+                               "hysteriaSettings": {"version": 2, "auth": auth}}}
+
+
+LINK_PARSERS = {"vless": parse_vless, "trojan": parse_trojan, "ss": parse_ss,
+                "hysteria2": parse_hysteria2, "hy2": parse_hysteria2}
+
+
+def parse_links(text, sid):
+    nodes, skipped = [], {}
+    for line in text.splitlines():
+        line = line.strip()
+        if "://" not in line:
+            continue
+        scheme = line.split("://", 1)[0].lower()
+        try:
+            if scheme == "vmess":
+                name, outbound = parse_vmess(line)
+            elif scheme in LINK_PARSERS:
+                name = up.unquote(up.urlsplit(line).fragment) if "#" in line else ""
+                outbound = LINK_PARSERS[scheme](line)
+            else:
+                add_skip(skipped, "unsupported_scheme", scheme)
+                continue
+        except Unsupported as why:
+            add_skip(skipped, str(why), scheme)
+            continue
+        except Exception:
+            add_skip(skipped, "parse_error", scheme)
+            continue
+        nid = short_hash(sid + line)
+        nodes.append({"id": nid, "name": name or "%s %s" % (scheme, nid), "kind": "node",
+                      "outbounds": [dict(outbound, tag="x-" + nid)], "target": "x-" + nid})
+    return nodes, skip_items(skipped)
+
+
+def retag(obj, mapping):
+    """Rename the references inside one JSON profile to the new tags."""
+    stream = obj.get("streamSettings") or {}
+    sockopt = stream.get("sockopt") or {}
+    if sockopt.get("dialerProxy") in mapping:
+        sockopt["dialerProxy"] = mapping[sockopt["dialerProxy"]]
+    proxy_settings = obj.get("proxySettings") or {}
+    if proxy_settings.get("tag") in mapping:
+        proxy_settings["tag"] = mapping[proxy_settings["tag"]]
+
+
+def parse_json_profiles(data, sid):
+    profiles = data if isinstance(data, list) else [data]
+    nodes, skipped = [], {}
+    seen = set()
+    for index, cfg in enumerate(profiles):
+        name = cfg.get("remarks") or "profile %d" % (index + 1)
+        outs = cfg.get("outbounds") or []
+        if any(o.get("protocol") == "loopback" for o in outs):
+            add_skip(skipped, "loopback_profile")
+            continue
+        proxies = [o for o in outs if o.get("protocol") not in SERVICE_PROTOCOLS]
+        if not proxies:
+            continue
+        if any(((o.get("streamSettings") or {}).get("tlsSettings") or {}).get("allowInsecure")
+               for o in proxies):
+            add_skip(skipped, "insecure_tls")
+            continue
+        routing = cfg.get("routing") or {}
+        target = None
+        for rule in reversed(routing.get("rules") or []):
+            conditions = set(rule) - {"type", "network", "outboundTag", "balancerTag", "ruleTag"}
+            if not conditions and (rule.get("outboundTag") or rule.get("balancerTag")):
+                target = ("balancer", rule["balancerTag"]) if rule.get("balancerTag") \
+                    else ("outbound", rule["outboundTag"])
+                break
+        if target is None:
+            target = ("outbound", proxies[0].get("tag"))
+        nid = short_hash(sid + json.dumps([proxies, routing.get("balancers")], sort_keys=True))
+        if nid in seen:
+            continue
+        seen.add(nid)
+        mapping = {o.get("tag"): "x-%s-%s" % (nid, o.get("tag") or i) for i, o in enumerate(proxies)}
+        new_outs = []
+        for o in proxies:
+            o = json.loads(json.dumps(o))
+            o["tag"] = mapping[o.get("tag")]
+            retag(o, mapping)
+            new_outs.append(o)
+        balancers = []
+        for b in routing.get("balancers") or []:
+            b = json.loads(json.dumps(b))
+            b["tag"] = "g-%s-%s" % (nid, b["tag"])
+            # selector in xray is a list of tag prefixes: carry the prefix into the profile.
+            b["selector"] = ["x-%s-%s" % (nid, s) for s in b.get("selector") or []]
+            if b.get("fallbackTag") in mapping:
+                b["fallbackTag"] = mapping[b["fallbackTag"]]
+            balancers.append(b)
+        if target[0] == "balancer":
+            kind, tgt = "group", "g-%s-%s" % (nid, target[1])
+            if not any(b["tag"] == tgt for b in balancers):
+                add_skip(skipped, "no_group")
+                continue
+        else:
+            if target[1] not in mapping:
+                add_skip(skipped, "no_node")
+                continue
+            kind, tgt = "node", mapping[target[1]]
+        nodes.append({"id": nid, "name": name, "kind": kind, "outbounds": new_outs,
+                      "balancers": balancers, "target": tgt})
+    return nodes, skip_items(skipped)
+
+
+def parse_subscription(body, sid):
+    text = body.decode("utf8", "replace").strip().lstrip("﻿")
+    if text[:1] in "[{":
+        try:
+            return parse_json_profiles(json.loads(text), sid)
+        except ValueError:
+            pass
+    if "://" not in text:
+        decoded = b64decode_loose(text)
+        if decoded and "://" in decoded:
+            text = decoded
+    if text.startswith(("proxies:", "mixed-port:", "port:")) or "\nproxies:" in text:
+        return [], [{"code": "clash_format", "scheme": "", "count": 1}]
+    return parse_links(text, sid)
+
+
+def load_nodes(sid):
+    path = os.path.join(SUBS_CACHE, sid + ".raw")
+    if not os.path.exists(path):
+        return []
+    with open(path, "rb") as fh:
+        nodes, _ = parse_subscription(fh.read(), sid)
+    return nodes
+
+
+def active_nodes():
+    subs = load_subs()
+    selection = read_json(SELECTION_FILE, {})
+    sid = active_sub_id(selection, subs)
+    return subs, selection, sid, (load_nodes(sid) if sid else [])
+
+
+# ---------------------------------------------------------------- selection
+
+def active_sub_id(selection, subs):
+    ids = [sub_id(s) for s in subs]
+    if selection.get("sub") in ids:
+        return selection["sub"]
+    return ids[0] if ids else None
+
+
+def fallback_problem(selection, nodes):
+    """Why the fallback node cannot work: a code, or None if it can."""
+    fb = selection.get("fallback") or {}
+    by_id = {n["id"]: n for n in nodes}
+    if selection.get("mode") != "node" or selection.get("node") not in by_id:
+        return "not_node_mode"
+    if by_id[selection["node"]]["kind"] != "node":
+        return "primary_not_node"
+    if not fb.get("node"):
+        return "no_fallback_node"
+    if fb["node"] not in by_id or by_id[fb["node"]]["kind"] != "node":
+        return "fallback_not_found"
+    if fb["node"] == selection["node"]:
+        return "same_node"
+    return None
+
+
+def fallback_pair(selection, nodes):
+    """(primary, fallback) if the fallback is on and applicable; otherwise None.
+    A stale setting (the node left the subscription) quietly does nothing."""
+    if not (selection.get("fallback") or {}).get("enabled"):
+        return None
+    if fallback_problem(selection, nodes):
+        return None
+    by_id = {n["id"]: n for n in nodes}
+    return by_id[selection["node"]], by_id[selection["fallback"]["node"]]
+
+
+def target_for(selection, nodes):
+    """Where tunnel traffic goes: the "auto" group, the selected node/profile
+    or the pinned balancer (the selected node with its fallback)."""
+    if selection.get("mode") == "node":
+        for n in nodes:
+            if n["id"] == selection.get("node"):
+                if fallback_pair(selection, nodes):
+                    return {"balancerTag": "pinned"}, n
+                key = "balancerTag" if n["kind"] == "group" else "outboundTag"
+                return {key: n["target"]}, n
+    return {"balancerTag": "auto"}, None
+
+
+# ---------------------------------------------------------------- per-site rules
+
+DOMAIN_RE = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                       r"(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})")
+
+
+def normalize_host(text):
+    """A domain (lower case, no scheme or path) or an IPv4 address; otherwise None."""
+    host = (text or "").strip().lower()
+    try:
+        return str(ipaddress.IPv4Address(host)), "ip"
+    except ValueError:
+        pass
+    if DOMAIN_RE.fullmatch(host) and not re.fullmatch(r"[\d.]+", host):
+        return host, "domain"
+    return None, None
+
+
+def load_rules():
+    """rules.json without junk: only valid hosts, each host in one list only."""
+    raw = read_json(RULES_FILE, {})
+    out, seen = {"direct": [], "tunnel": []}, set()
+    if not isinstance(raw, dict):
+        return out
+    for side in ("direct", "tunnel"):
+        for item in raw.get(side) or []:
+            host, _ = normalize_host(item if isinstance(item, str) else "")
+            if host and host not in seen:
+                seen.add(host)
+                out[side].append(host)
+    return out
+
+
+def user_rules(target, rules):
+    """The user's rules. A longer domain comes first: tunnel for mail.x.com
+    overrides direct for x.com."""
+    items = []
+    for side in ("direct", "tunnel"):
+        for host in rules[side]:
+            _, kind = normalize_host(host)
+            items.append((host.count(".") if kind == "domain" else 99, side, kind, host))
+    items.sort(key=lambda i: -i[0])
+    out = []
+    for _, side, kind, host in items:
+        key = "domain" if kind == "domain" else "ip"
+        value = "domain:" + host if kind == "domain" else host
+        dest = {"outboundTag": "direct"} if side == "direct" else dict(target)
+        if out and key in out[-1] and out[-1]["_side"] == side and len(out[-1]) == 3:
+            out[-1][key].append(value)
+            continue
+        out.append(dict({key: [value], "_side": side}, **dest))
+    for r in out:
+        del r["_side"]
+    return out
+
+
+def rule_for(host, ip, rules):
+    """Which of the user's rules would match a connection: by host/suffix or by address."""
+    best = None
+    for side in ("direct", "tunnel"):
+        for h in rules[side]:
+            if h == ip or h == host or (host and host.endswith("." + h)):
+                depth = h.count(".") if not re.fullmatch(r"[\d.]+", h) else 99
+                if best is None or depth > best[0]:
+                    best = (depth, side)
+    return best[1] if best else None
+
+
+# ---------------------------------------------------------------- building the config
+
+def harden(outbound, iface=None):
+    """Sockets to the node: marked and through the physical interface, past our own TUN."""
+    stream = outbound.setdefault("streamSettings", {})
+    sockopt = stream.setdefault("sockopt", {})
+    chained = sockopt.get("dialerProxy") or (outbound.get("proxySettings") or {}).get("tag")
+    if not chained:
+        sockopt["mark"] = MARK
+        if iface:
+            sockopt["interface"] = iface
+        # The node's name is resolved by the built-in DNS, which asks the router for node names:
+        # otherwise the system resolver would ask xray itself, and the tunnel would wait for itself.
+        sockopt.setdefault("domainStrategy", "UseIPv4")
+    return outbound
+
+
+def node_hosts(nodes):
+    hosts = set()
+    for n in nodes:
+        for o in n["outbounds"]:
+            s = o.get("settings") or {}
+            for server in (s.get("vnext") or []) + (s.get("servers") or []) + [s]:
+                addr = server.get("address") if isinstance(server, dict) else None
+                if addr and not re.fullmatch(r"[\d.]+|[0-9a-fA-F:]+", addr):
+                    hosts.add(addr)
+    return sorted(hosts)
+
+
+def routing_rules(target, rules=None, net=None, st=None):
+    net = network() if net is None else net
+    st = st or load_settings()
+    lan_dns = (net or {}).get("lan_dns") or []
+    head = [
+        # Queries that are not about addresses (TXT, SRV, MX) are not served by the built-in DNS:
+        # dns-out passes them as they are to 1.1.1.1, and the dns-relay loop brings them
+        # back into routing, so they go into the tunnel, not out in clear text.
+        dict({"inboundTag": ["dns-relay-in"]}, **target),
+        {"inboundTag": ["dns-in"], "outboundTag": "dns-out"},
+        # DNS hijack: an application asked another resolver, bypassing the system one;
+        # the core answers anyway, and no query leaves in clear text.
+        {"inboundTag": ["tun"], "port": "53", "outboundTag": "dns-out"},
+        {"inboundTag": ["dns-internal"], "ip": lan_dns, "outboundTag": "direct"},
+        dict({"inboundTag": ["dns-internal"]}, **target),
+    ]
+    if not lan_dns:
+        del head[3]
+    direct_ip = ["geoip:" + c for c in st["direct_geo"]["geoip"]]
+    tail_rules = [
+        {"ip": ["geoip:private"] + st["local_nets"], "outboundTag": "direct"},
+        {"domain": direct_domains(st), "outboundTag": "direct"},
+        {"ip": direct_ip, "outboundTag": "direct"},
+        dict({"network": "tcp,udp"}, **target),
+    ]
+    tail_rules = [r for r in tail_rules if r.get("domain", True) and r.get("ip", True)]
+    rules = head + user_rules(target, rules or {"direct": [], "tunnel": []}) + tail_rules
+    for i, rule in enumerate(rules):
+        rule["type"] = "field"
+        rule["ruleTag"] = "r%d" % i
+    return rules
+
+
+def all_balancers(nodes, selection=None):
+    """The "auto" group over all nodes of the subscription, plus groups from JSON profiles
+    and, with the fallback node on, pinned: the primary, and the fallback when the primary dies."""
+    out = [{"tag": "auto", "selector": ["x-"], "strategy": {"type": "leastPing"},
+            "fallbackTag": nodes[0]["outbounds"][0]["tag"]}]
+    for n in nodes:
+        out += n.get("balancers") or []
+    pair = fallback_pair(selection or {}, nodes)
+    if pair:
+        # leastPing picks only among the living, by observatory data;
+        # with none alive the core takes fallbackTag. The primary comes back: it is used again.
+        out.append({"tag": "pinned", "selector": [pair[0]["target"]], "strategy": {"type": "leastPing"},
+                    "fallbackTag": pair[1]["target"]})
+    return out
+
+
+def observatory_for(selection, nodes, proxy_tags):
+    pair = fallback_pair(selection, nodes)
+    # Node probing: less often on a big subscription, or the background becomes hundreds of requests.
+    interval = "2m" if len(proxy_tags) <= 40 else "10m"
+    selector = ["x-"]
+    if pair:
+        interval = FALLBACK_PROBE
+        if len(proxy_tags) > 40:
+            selector = [pair[0]["target"], pair[1]["target"]]
+    return {"subjectSelector": selector, "probeURL": PROBE_URL,
+            "probeInterval": interval, "enableConcurrency": True}
+
+
+def build_config(selection, nodes, rules=None, net=None):
+    net = (network() or {}) if net is None else net
+    st = load_settings()
+    iface = net.get("iface")
+    target, _ = target_for(selection, nodes)
+    outbounds = []
+    for n in nodes:
+        outbounds += [harden(json.loads(json.dumps(o)), iface) for o in n["outbounds"]]
+    proxy_tags = [o["tag"] for o in outbounds]
+    balancers = all_balancers(nodes, selection)
+    return {
+        "log": {"loglevel": "warning", "access": ACCESS_LOG, "error": ERROR_LOG, "dnsLog": True},
+        "api": {"tag": "api", "listen": API,
+                "services": ["RoutingService", "StatsService", "HandlerService", "ObservatoryService"]},
+        "metrics": {"tag": "metrics", "listen": METRICS.split("//")[1].split("/")[0]},
+        "stats": {},
+        "policy": {"system": {"statsOutboundUplink": True, "statsOutboundDownlink": True}},
+        "observatory": observatory_for(selection, nodes, proxy_tags),
+        "dns": {
+            "servers": [
+                {"address": a, "domains": lan_dns_domains(st, net) + ["full:" + h for h in node_hosts(nodes)],
+                 "skipFallback": True} for a in (net.get("lan_dns") or [])[:2]
+            ] + [
+                "https://1.1.1.1/dns-query",
+                "https://8.8.8.8/dns-query",
+            ],
+            "queryStrategy": "UseIPv4",
+            "tag": "dns-internal",
+        },
+        "inbounds": [
+            {"tag": "tun", "protocol": "tun",
+             "settings": {"name": DEV, "MTU": 1500, "gateway": [GATEWAY]},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}},
+            {"tag": "dns-in", "listen": "127.0.0.1", "port": 53, "protocol": "dokodemo-door",
+             "settings": {"address": "1.1.1.1", "port": 53, "network": "tcp,udp"}},
+        ],
+        "outbounds": outbounds + [
+            {"tag": "direct", "protocol": "freedom",
+             "streamSettings": {"sockopt": dict({"mark": MARK, "domainStrategy": "UseIPv4"},
+                                                **({"interface": iface} if iface else {}))}},
+            {"tag": "block", "protocol": "blackhole"},
+            {"tag": "dns-out", "protocol": "dns",
+             "settings": {"nonIPQuery": "skip", "address": "1.1.1.1", "port": 53, "network": "tcp"},
+             "streamSettings": {"sockopt": {"dialerProxy": "dns-relay"}}},
+            {"tag": "dns-relay", "protocol": "loopback", "settings": {"inboundTag": "dns-relay-in"}},
+        ],
+        "routing": {"domainStrategy": "AsIs", "balancers": balancers,
+                    "rules": routing_rules(target, load_rules() if rules is None else rules, net, st)},
+    }
+
+
+def ensure_geo():
+    """geoip.dat and geosite.dat in ASSET_DIR are links to the distribution's
+    copies. Anything else there (a file the 0.5 `geo` command downloaded from a
+    third party without a check, a dangling link) is replaced by the link."""
+    os.makedirs(ASSET_DIR, exist_ok=True)
+    for name in GEO_FILES:
+        path = os.path.join(ASSET_DIR, name)
+        system = os.path.join(SYSTEM_GEO_DIR, name)
+        if not os.path.exists(system):
+            continue
+        if os.path.islink(path) and os.readlink(path) == system:
+            continue
+        if os.path.lexists(path):
+            os.unlink(path)
+        os.symlink(system, path)
+
+
+def xray_test(path, binary=None):
+    ensure_geo()
+    env = dict(os.environ, XRAY_LOCATION_ASSET=ASSET_DIR)
+    try:
+        os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    except OSError as error:
+        # No user session (no /run/user/UID): the config's logs have nowhere to go.
+        return False, "no runtime directory %s (%s); run this in your desktop session" % (RUN_DIR, error.strerror)
+    r = subprocess.run([binary or XRAY, "run", "-test", "-c", path], capture_output=True, text=True,
+                       env=env, timeout=60)
+    ok = "Configuration OK" in r.stdout
+    if ok:
+        return True, ""
+    lines = (r.stdout + r.stderr).strip().splitlines()
+    failed = [l for l in lines if "Failed" in l or "failed" in l]
+    # The last link of the chain "> ... > ..." is the reason itself; it holds no node secrets.
+    return False, (failed or lines or [""])[-1].split(" > ")[-1]
+
+
+def cmd_build(args):
+    """Build the config. An error does not break the start: the previous working config stays."""
+    try:
+        subs, selection, sid, nodes = active_nodes()
+        if not nodes:
+            raise RuntimeError("the active subscription has no nodes (xray-omarchy update)")
+        net = network(refresh=True)
+        if not net:
+            raise RuntimeError("cannot detect the network: " + network_error())
+        cfg = build_config(selection, nodes, net=net)
+        os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+        candidate = CONFIG_FILE[:-5] + ".new.json"
+        write_private(candidate, json.dumps(cfg, ensure_ascii=False, indent=1))
+        ok, err = xray_test(candidate)
+        if not ok:
+            os.unlink(candidate)
+            raise RuntimeError("xray rejected config: " + err)
+        os.replace(candidate, CONFIG_FILE)
+        say("config built: %d nodes" % len(nodes))
+    except Exception as error:
+        say("config not rebuilt (%s)%s" % (
+            error, ", keeping the previous one" if os.path.exists(CONFIG_FILE) else ""))
+        return 0 if os.path.exists(CONFIG_FILE) else 1
+    return 0
+
+
+# ---------------------------------------------------------------- routes, killswitch, DNS
+
+def dev_is_up():
+    """The TUN exists and is administratively up (IFF_UP); a TUN's operstate stays "unknown"."""
+    try:
+        with open("/sys/class/net/%s/flags" % DEV) as fh:
+            return int(fh.read().strip(), 16) & 0x1 == 0x1
+    except (OSError, ValueError):
+        return False
+
+
+def net_record(code, detail=""):
+    try:
+        write_json(NET_FILE, {"code": code, "detail": detail[:200], "time": int(time.time())})
+    except OSError:
+        pass
+
+
+def net_failure():
+    """The code of the last failed `net up` if it is recent ("" otherwise):
+    while it fails the unit is restarting, never `active`, and status says why."""
+    rec = read_json(NET_FILE, {})
+    if not isinstance(rec, dict) or not rec.get("code"):
+        return ""
+    if time.time() - (rec.get("time") or 0) > NET_FAIL_FRESH:
+        return ""
+    return str(rec["code"])
+
+
+def cmd_net(args):
+    if args.action == "up":
+        # The core creates the device and brings it up a moment later; a route
+        # to a device that is not up yet is refused ("Device for nexthop is not
+        # up"), which at boot left the tunnel running without routes.
+        for _ in range(100):
+            if dev_is_up():
+                break
+            time.sleep(0.1)
+        else:
+            say("net: device %s did not come up" % DEV)
+            net_record("no_tun", "device %s did not come up" % DEV)
+            return 1
+        # ip rule 9100 (main without a default route) and 9110 (everything else into the TUN,
+        # except the core's marked sockets) are set by the helper. A refusal is
+        # tried again a few times (the device may go down and up once more
+        # while the core starts), except 4: a TUN not held by this user's core.
+        for attempt in range(5):
+            if attempt:
+                time.sleep(1)
+            r = helper("route", "up")
+            if r.returncode in (0, 4):
+                break
+        if r.returncode != 0:
+            why = (r.stderr.strip() or r.stdout.strip())[:200]
+            say("net: routes not set (%s)" % why)
+            # Non-zero: ExecStartPost fails, the unit stops (net down) and
+            # systemd starts it again (Restart=always): it never stays
+            # `active` without routes, and it heals by itself once routes can
+            # be set. `on` reads the code: 4 is a TUN not held by this user's core.
+            net_record("foreign_tun" if r.returncode == 4 else "not_routed", why)
+            return 1
+        net_record("")
+        # Which node probing the core started with: probing changes only with a restart,
+        # and fallback/select decide from this snapshot whether one is needed.
+        cfg = read_json(CONFIG_FILE, {})
+        if cfg.get("observatory"):
+            try:
+                write_json(STARTED_FILE, {"observatory": cfg["observatory"], "time": int(time.time())})
+            except OSError:
+                pass
+        say("net: routes into %s are set" % DEV)
+        return 0
+    helper("route", "down")
+    say("net: routes removed")
+    return 0
+
+
+def killswitch_args(net):
+    """(helper arguments, warnings). The network's DNS and DHCP servers are let
+    past the killswitch only inside the local networks: a public DNS from the
+    router (8.8.8.8, say) would be DNS past the tunnel, so it is left out."""
+    st = load_settings()
+    nets = st["local_nets"]
+    warnings = list(st["warnings"])
+    args = ["killswitch", "on"]
+    for addr in (net or {}).get("lan_dns") or []:
+        addr = _clean_ip(addr)
+        if not addr:
+            continue
+        if in_nets(addr, nets):
+            args += ["--lan-dns", addr]
+        else:
+            warnings.append("the network's DNS %s is public: programs cannot reach it past the killswitch, "
+                            "but the core asks it for node names and local zones in plain DNS" % addr)
+    for cidr in nets:
+        args += ["--local-net", cidr]
+    server = _clean_ip((net or {}).get("dhcp_server") or "")
+    if server and ipaddress.ip_address(server).version == 4:
+        if in_nets(server, nets):
+            args += ["--dhcp-server", server]
+        else:
+            warnings.append("the DHCP server %s is not in a local network: renewals go by broadcast only"
+                            % server)
+    return args, warnings
+
+
+def killswitch_on():
+    """Without a live tunnel nobody goes out through the physical interfaces
+    except the core's sockets and Tailscale, local networks, DHCP, the network's DNS and time sync.
+    nftables table inet xray-omarchy; the helper remembers it and restores it at boot."""
+    args, warnings = killswitch_args(network(refresh=True))
+    for w in warnings:
+        log("killswitch: " + w)
+    r = helper(*args)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr.strip() or r.stdout.strip() or "helper failed")[:200])
+
+
+def killswitch_off():
+    r = helper("killswitch", "off")
+    if r.returncode != 0:
+        log("killswitch off: %s" % (r.stderr.strip() or r.stdout.strip())[:200])
+
+
+def killswitch_state():
+    """on | off | tampered (the table in the kernel is not the one loaded) | unknown."""
+    out = helper("killswitch", "status").stdout.strip()
+    return out if out in ("on", "off", "tampered") else "unknown"
+
+
+def cmd_fw(args):
+    """Non-zero unless the killswitch is in the asked state: the unit's
+    ExecStartPre=fw on must keep the core from starting without it."""
+    try:
+        if args.action == "on":
+            killswitch_on()
+        else:
+            killswitch_off()
+    except Exception as error:
+        say("killswitch: not applied (%s)" % error)
+        return 1
+    state = killswitch_state()
+    say("killswitch: %s" % state)
+    return 0 if state == args.action else 1
+
+
+def dns_set(on):
+    """System DNS to the core (127.0.0.1) or back to the network. Through the helper: from
+    a background service polkit would ask for a password nobody is there to type.
+    Returns "" or an error code."""
+    net = network(refresh=True)
+    if on:
+        if not net:
+            return "network_unknown"
+        # The helper saves the connection's own DNS settings first and puts
+        # exactly them back on `dns off`.
+        r = helper("dns", "on", net["uuid"], net["iface"])
+        if r.returncode != 0:
+            log("dns on: %s" % (r.stderr.strip() or r.stdout.strip())[:200])
+            # 4: 127.0.0.1:53 is not this user's core — DNS is not handed to it.
+            return "foreign_dns" if r.returncode == 4 else "dns_failed"
+        return ""
+    # Back only what the helper switched and saved: its list, not a guess.
+    r = helper("dns", "list")
+    try:
+        targets = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else None
+    except (ValueError, IndexError):
+        targets = None
+    if not isinstance(targets, list):
+        log("dns list: %s" % (r.stderr.strip() or r.stdout.strip())[:200])
+        return "dns_failed"
+    code = ""
+    for t in targets:
+        if not isinstance(t, dict) or not isinstance(t.get("uuid"), str):
+            continue
+        iface = t.get("iface") or (net or {}).get("iface") or "lo"
+        r = helper("dns", "off", t["uuid"], iface)
+        if r.returncode != 0:
+            log("dns off: %s" % (r.stderr.strip() or r.stdout.strip())[:200])
+            code = "dns_failed"
+    return code
+
+
+RESOLVECTL_LINE = re.compile(r"(?:Global|Link \d+ \(([^)]*)\)):(.*)")
+
+
+def dns_servers():
+    """Every DNS server systemd-resolved may ask, per link: [(link, server)].
+    None when resolvectl does not answer."""
+    try:
+        r = run(["resolvectl", "dns"], timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    out = []
+    for line in r.stdout.splitlines():
+        m = RESOLVECTL_LINE.fullmatch(line.strip())
+        if m:
+            out += [(m.group(1) or "", server) for server in m.group(2).split()]
+    return out
+
+
+def dns_state():
+    """xray: the core is the only DNS the system asks; router: the core is not
+    asked at all; mixed: both (another link or an IPv6 server from the router
+    answers past the core); unknown: resolvectl did not answer.
+    Tailscale's link is not counted: MagicDNS answers inside the tailnet."""
+    servers = dns_servers()
+    if servers is None:
+        # No systemd-resolved: the system asks what resolv.conf names.
+        try:
+            with open("/etc/resolv.conf", encoding="utf8") as fh:
+                servers = [("", l.split()[1]) for l in fh if l.startswith("nameserver") and len(l.split()) > 1]
+        except OSError:
+            return "unknown"
+        if not servers:
+            return "unknown"
+    servers = [(link, s) for link, s in servers if not (link == DEV or link.startswith("tailscale"))]
+    core = [s for _, s in servers if s.split("#")[0] in ("127.0.0.1", "127.0.0.1:53")]
+    if core and len(core) == len(servers):
+        return "xray"
+    return "mixed" if core else "router"
+
+
+def cmd_dns(args):
+    code = dns_set(args.action == "on")
+    if code == "network_unknown":
+        say("system DNS: not switched, cannot detect the network (%s)" % network_error())
+        return 1
+    if code == "foreign_dns":
+        say("system DNS: not switched, 127.0.0.1:53 is not served by your xray core (see %s)" % LOG_FILE)
+        return 4
+    if code:
+        say("system DNS: not switched, the helper refused (see %s)" % LOG_FILE)
+        return 1
+    time.sleep(1)
+    say("system DNS: %s" % dns_state())
+    return 0
+
+
+# ---------------------------------------------------------------- service
+
+def service_active(unit=None):
+    return run(["systemctl", "--user", "is-active", "--quiet", unit or UNIT]).returncode == 0
+
+
+def restart_core():
+    cmd_build(None)
+    run(["systemctl", "--user", "restart", UNIT], timeout=60)
+
+
+def journal_lines(limit=40):
+    """Journal lines of the service's current run only: earlier failures do not count."""
+    inv = run(["systemctl", "--user", "show", "-p", "InvocationID", "--value", UNIT]).stdout.strip()
+    if inv:
+        # Lines from the service's processes carry _SYSTEMD_INVOCATION_ID, systemd's own
+        # lines about it carry USER_INVOCATION_ID.
+        cmd = ["journalctl", "--user", "_SYSTEMD_INVOCATION_ID=" + inv, "+", "USER_INVOCATION_ID=" + inv]
+    else:
+        cmd = ["journalctl", "--user", "-u", UNIT]
+    return run(cmd + ["-n", str(limit), "-o", "cat", "--no-pager"]).stdout.splitlines()
+
+
+REJECT_MARKERS = ("xray rejected config: ",)
+# This program's own lines in the unit's journal (ExecStartPre/Post): never
+# taken for the core's reason.
+OWN_PREFIXES = ("config ", "killswitch:", "net:", "system DNS:", "network changed")
+
+
+def core_failure_detail():
+    """The last meaningful journal line of the current run: why the core did not come up."""
+    for line in reversed(journal_lines()):
+        # From our own messages take only what they quote from xray.
+        for marker in REJECT_MARKERS:
+            if marker in line:
+                return ("config rejected: " + line.split(marker, 1)[1].rstrip(")"))[:200]
+        if line.startswith(OWN_PREFIXES) or any(n in line for n in ERROR_NOISE):
+            continue
+        low = line.lower()
+        if "failed to start" in low or "error" in low:
+            return line.split(" > ")[-1].strip()[:200]
+    return ""
+
+
+def net_reason():
+    """(code, detail) when this start's `net up` failed, else None. The unit
+    keeps retrying by itself (Restart=always); the killswitch holds meanwhile."""
+    rec = read_json(NET_FILE, {})
+    code = rec.get("code") if isinstance(rec, dict) else None
+    if code == "foreign_tun":
+        return code, "%s is held by something other than your xray core" % DEV
+    if code in ("not_routed", "no_tun"):
+        return code, str(rec.get("detail") or "")
+    return None
+
+
+def cmd_on(args):
+    net = network(refresh=True)
+    if not net:
+        why = network_error()
+        return finish(args, False, "network_unknown", why, "cannot detect the network: %s" % why)
+    try:
+        os.unlink(NET_FILE)
+    except OSError:
+        pass
+    # enable: the tunnel comes back after a reboot until `off`.
+    r = run(["systemctl", "--user", "enable", "--now", UNIT], timeout=60)
+    if r.returncode != 0:
+        net = net_reason()
+        if net:
+            return finish(args, False, net[0], net[1], "tunnel did not come up (%s) %s" % net)
+        detail = core_failure_detail()
+        return finish(args, False, "start_failed", detail, "core did not start: %s" % (detail or r.stderr.strip()))
+    # Type=simple: start returns at once, and the core may die a second later.
+    for _ in range(40):
+        if service_active() and os.path.exists("/sys/class/net/" + DEV) \
+                and "%d:" % PREF_TUN in run(["ip", "rule"]).stdout:
+            break
+        time.sleep(0.25)
+    else:
+        detail = core_failure_detail()
+        code = "core_crashed" if not service_active() else "no_tun"
+        net = net_reason()
+        if net:
+            code, detail = net
+        return finish(args, False, code, detail, "tunnel did not come up (%s) %s" % (code, detail))
+    code = dns_set(True)
+    time.sleep(1)
+    if code == "network_unknown":
+        why = network_error()
+        return finish(args, False, "network_unknown", why, "tunnel is up, but the network is unknown: %s" % why)
+    if code == "foreign_dns":
+        return finish(args, False, "foreign_dns", "",
+                      "tunnel is up, but 127.0.0.1:53 is held by something other than your xray core: "
+                      "system DNS not switched")
+    if dns_state() != "xray":
+        return finish(args, False, "dns_failed", "", "tunnel is up, but system DNS did not switch to the core")
+    return finish(args, True, "", "", "tunnel is up")
+
+
+def cmd_off(args):
+    # Order: the killswitch first, or without the tunnel there is no way out at all.
+    killswitch_off()
+    if killswitch_state() != "off":
+        return finish(args, False, "killswitch_failed", "", "killswitch did not lift, keeping the tunnel")
+    dns_set(False)
+    run(["systemctl", "--user", "disable", "--now", UNIT], timeout=60)
+    time.sleep(1)
+    if service_active():
+        return finish(args, False, "stop_failed", "", "core did not stop")
+    if dns_state() != "router":
+        return finish(args, False, "dns_failed", "",
+                      "tunnel is down, but system DNS did not return to the network's own settings")
+    net = network(refresh=True) or {}
+    servers = ", ".join(net.get("lan_dns") or []) or "none known"
+    return finish(args, True, "", "", "tunnel is down, direct exit, the network's DNS (%s: %s)"
+                  % (DNS_SOURCE_TEXT.get(net.get("source"), net.get("source") or "unknown"), servers))
+
+
+def running_observatory(selection, nodes):
+    """The node probing the core started with. No snapshot (the core was started
+    by an earlier version) means the earlier probing, without the fallback node."""
+    snap = read_json(STARTED_FILE, {})
+    if snap.get("observatory"):
+        return snap["observatory"]
+    tags = [o["tag"] for n in nodes for o in n["outbounds"]]
+    return observatory_for(dict(selection, fallback={"enabled": False}), nodes, tags)
+
+
+def restart_needed(selection, nodes):
+    if not nodes or not service_active():
+        return False
+    return build_config(selection, nodes)["observatory"] != running_observatory(selection, nodes)
+
+
+def live_selection(selection, nodes):
+    """What can be applied to the running core. pinned without probing the primary
+    would move all traffic to the fallback, so until a restart it is left out."""
+    pair = fallback_pair(selection, nodes)
+    if not pair:
+        return selection
+    probed = running_observatory(selection, nodes).get("subjectSelector") or []
+    if any(pair[0]["target"].startswith(s) for s in probed):
+        return selection
+    return dict(selection, fallback=dict(selection["fallback"], enabled=False))
+
+
+def push_rules(selection, nodes):
+    """Rules and balancers into the running core as a whole, without a restart."""
+    selection = live_selection(selection, nodes)
+    target, _ = target_for(selection, nodes)
+    balancers = all_balancers(nodes, selection)
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    path = os.path.join(RUN_DIR, "rules.json")
+    write_private(path, json.dumps({"routing": {"balancers": balancers,
+                                                "rules": routing_rules(target, load_rules())}}))
+    # adrules builds the rules on the client side, so it needs geoip/geosite too.
+    r = subprocess.run([XRAY, "api", "adrules", "--server=" + API, path], capture_output=True,
+                       text=True, timeout=15, env=dict(os.environ, XRAY_LOCATION_ASSET=ASSET_DIR))
+    os.unlink(path)
+    return r.returncode == 0 and "failed" not in (r.stdout + r.stderr)
+
+
+def cmd_select(args):
+    subs, selection, sid, nodes = active_nodes()
+    if args.node == "auto":
+        selection.update({"sub": sid, "mode": "auto", "node": None})
+        label = "auto"
+    else:
+        match = [n for n in nodes if n["id"] == args.node]
+        if not match:
+            return finish(args, False, "not_found", args.node,
+                          "node %s is not in the active subscription" % args.node)
+        selection.update({"sub": sid, "mode": "node", "node": args.node})
+        label = match[0]["name"]
+    write_json(SELECTION_FILE, selection)
+    cmd_build(None)
+    if not service_active():
+        return finish(args, True, "", "", "selected: %s" % label)
+    if push_rules(selection, nodes):
+        code, text = "", "selected: %s (no restart)" % label
+    else:
+        code, text = "restarted", "selected: %s; live rules were not accepted, restarting the core" % label
+        run(["systemctl", "--user", "restart", UNIT], timeout=60)
+    if not code and restart_needed(selection, nodes) and live_selection(selection, nodes) is not selection:
+        # Big subscription with a fallback: the core does not probe the new primary.
+        code, text = "restart_needed", text + "; the fallback node starts working after a core restart"
+    # The exit address is cached for 10 minutes; after a node change it is stale.
+    exit_info(refresh=True)
+    return finish(args, True, code, "", text)
+
+
+def cmd_use(args):
+    subs = load_subs()
+    match = [s for s in subs if s["name"] == args.name]
+    if not match:
+        return finish(args, False, "not_found", args.name, "no subscription %s" % args.name)
+    sid = sub_id(match[0])
+    if not load_nodes(sid):
+        return finish(args, False, "no_nodes", args.name,
+                      "subscription %s has no nodes, run xray-omarchy update first" % args.name)
+    write_json(SELECTION_FILE, {"sub": sid, "mode": "auto", "node": None})
+    if service_active():
+        restart_core()
+    else:
+        cmd_build(None)
+    return finish(args, True, "", "", "active subscription: %s, auto mode" % args.name)
+
+
+# ---------------------------------------------------------------- fallback node
+
+def apply_change(args, selection, nodes, text):
+    """Save the choice, rebuild the config and apply it live; a restart
+    only with --apply (the panel asks for confirmation)."""
+    write_json(SELECTION_FILE, selection)
+    cmd_build(None)
+    if not service_active():
+        return finish(args, True, "", "", text + " (core is not running, applies on start)")
+    need = restart_needed(selection, nodes)
+    if need and getattr(args, "apply", False):
+        run(["systemctl", "--user", "restart", UNIT], timeout=60)
+        return finish(args, True, "restarted", "", text + "; core restarted")
+    if not push_rules(selection, nodes):
+        return finish(args, False, "apply_failed", "live rules were not accepted",
+                      text + "; saved, but the running core did not accept the rules (applies on restart)")
+    if need:
+        return finish(args, True, "restart_needed", "node probing interval changes on core restart",
+                      text + "; probing interval changes on core restart: run again with --apply")
+    return finish(args, True, "", "", text + " (no restart)")
+
+
+def cmd_fallback(args):
+    subs, selection, sid, nodes = active_nodes()
+    by_id = {n["id"]: n for n in nodes}
+    fb = dict(selection.get("fallback") or {"enabled": False, "node": None})
+    if args.action == "set":
+        if not args.node or args.node not in by_id or by_id[args.node]["kind"] != "node":
+            return finish(args, False, "fallback_not_found", args.node or "",
+                          "node %s is not a plain node of the active subscription" % args.node)
+        if selection.get("mode") == "node" and args.node == selection.get("node"):
+            return finish(args, False, "same_node", args.node,
+                          "the fallback node must differ from the selected one")
+        fb["node"] = args.node
+        selection["fallback"] = fb
+        if not fb.get("enabled"):
+            write_json(SELECTION_FILE, selection)
+            return finish(args, True, "", "", "fallback node: %s (fallback is off)" % by_id[args.node]["name"])
+        return apply_change(args, selection, nodes, "fallback node: %s" % by_id[args.node]["name"])
+    if args.action == "on":
+        problem = fallback_problem(dict(selection, fallback=fb), nodes)
+        if problem:
+            text = {"not_node_mode": "fallback works only with a manually selected node",
+                    "primary_not_node": "the selected entry is a group, not a node",
+                    "no_fallback_node": "no fallback node set: xray-omarchy fallback set ID",
+                    "fallback_not_found": "the fallback node is not in the active subscription",
+                    "same_node": "the fallback node must differ from the selected one"}[problem]
+            return finish(args, False, problem, "", text)
+        fb["enabled"] = True
+        selection["fallback"] = fb
+        return apply_change(args, selection, nodes, "fallback on: %s" % by_id[fb["node"]]["name"])
+    fb["enabled"] = False
+    selection["fallback"] = fb
+    return apply_change(args, selection, nodes, "fallback off")
+
+
+def balancer_pick(tag="auto"):
+    """(whether the core answered, the selected tag). An empty choice in pinned means the
+    primary is not alive and traffic goes to fallbackTag."""
+    r = run([XRAY, "api", "bi", "--server=" + API, tag], timeout=5)
+    if r.returncode != 0 or "Selects:" not in r.stdout:
+        return False, None
+    m = re.search(r"Selects:\s*\n\s*\d+\s+(\S+)", r.stdout)
+    return True, (m.group(1) if m else None)
+
+
+def fallback_status(selection, nodes, running, with_restart=True):
+    fb = selection.get("fallback") or {}
+    by_id = {n["id"]: n for n in nodes}
+    pair = fallback_pair(selection, nodes)
+    out = {"enabled": bool(fb.get("enabled")), "node": fb.get("node"),
+           "node_name": by_id[fb["node"]]["name"] if fb.get("node") in by_id else None,
+           "active": False, "ready": bool(pair),
+           "problem": fallback_problem(selection, nodes) if fb.get("enabled") else None,
+           "restart_needed": restart_needed(selection, nodes) if running and with_restart else False,
+           "pick": None}
+    if pair and running:
+        answered, pick = balancer_pick("pinned")
+        if not answered:
+            out["active"] = None  # the core does not know pinned (not applied yet)
+        else:
+            out["pick"] = pick
+            out["active"] = pick != pair[0]["target"]
+    return out
+
+
+# ---------------------------------------------------------------- state
+
+def metrics():
+    try:
+        with urllib.request.urlopen(METRICS, timeout=2) as resp:
+            return json.load(resp)
+    except Exception:
+        return None
+
+
+def account_traffic(m):
+    """Accumulates traffic per day: the core's counters reset on every restart."""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    lock = open(TRAFFIC_FILE + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        t = read_json(TRAFFIC_FILE, {})
+        now = time.time()
+        today = time.strftime("%F")
+        days = t.setdefault("days", {})
+        day = days.setdefault(today, {"tunnel_up": 0, "tunnel_down": 0, "direct_up": 0, "direct_down": 0})
+        cur = {"tunnel_up": 0, "tunnel_down": 0, "direct_up": 0, "direct_down": 0}
+        for tag, v in ((m or {}).get("stats") or {}).get("outbound", {}).items():
+            side = "direct" if tag == "direct" else "tunnel" if tag.startswith("x-") else None
+            if side:
+                cur[side + "_up"] += v.get("uplink", 0)
+                cur[side + "_down"] += v.get("downlink", 0)
+        last = t.get("last") or {}
+        rate = {}
+        dt = now - last.get("ts", now)
+        for key, value in cur.items():
+            prev = last.get(key, 0)
+            delta = value - prev if value >= prev else value  # the core restarted
+            day[key] = day.get(key, 0) + delta
+            rate[key] = int(delta / dt) if dt > 0.5 else 0
+        t["last"] = dict(cur, ts=now)
+        if dt > 0.5:
+            t["rate"] = rate
+        for old in sorted(days)[:-31]:
+            del days[old]
+        write_json(TRAFFIC_FILE, t)
+        return day, t.get("rate", {})
+    finally:
+        lock.close()
+
+
+def tail(path, limit, max_bytes=400_000):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            lines = fh.read().decode("utf8", "replace").splitlines()
+    except OSError:
+        return []
+    return lines[-limit:]
+
+
+ACCESS_RE = re.compile(r"^(\S+ \S+) from (\S+) accepted (\w+):(.+):(\d+) \[(.+?)\]")
+DNS_RE = re.compile(r"(?:got answer|cache HIT): (\S+?)\.? (?:Type\w+ )?-> \[([^\]]*)\]")
+# In and out in the core's log: "tun -> x-...", through a balancer "tun >> x-...".
+DETOUR_RE = re.compile(r"\s*(?:==>|->|>>)\s*")
+
+
+def ip_names():
+    """Address to name from the core's DNS answers, accumulated.
+
+    The system resolver caches answers and does not ask the core every time, so
+    one tail of the log is not enough. The table lives in tmpfs next to the log and goes
+    away with it; only what was appended since the last read is read.
+    """
+    path = os.path.join(RUN_DIR, "names.json")
+    state = read_json(path, {})
+    names, offset = state.get("names", {}), state.get("offset", 0)
+    try:
+        with open(ACCESS_LOG, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            if size < offset:  # the log was truncated
+                offset = max(0, size - 400_000)
+            fh.seek(offset)
+            chunk = fh.read(4_000_000)
+            offset += len(chunk)
+    except OSError:
+        return names
+    for line in chunk.decode("utf8", "replace").splitlines():
+        d = DNS_RE.search(line)
+        if d:
+            # An answer with several addresses: "[a, b]"; the comma is not part of an address.
+            for ip in re.split(r"[,\s]+", d.group(2).strip()):
+                names[ip] = d.group(1)
+    if len(names) > 5000:
+        names = dict(list(names.items())[-4000:])
+    try:
+        write_json(path, {"names": names, "offset": offset})
+    except OSError:
+        pass
+    return names
+
+
+def recent_connections(names, limit=60, rules=None):
+    """Where connections went: address to name by the core's DNS answers, route to node."""
+    rules = rules or load_rules()
+    lines = tail(ACCESS_LOG, 4000)
+    ip_name = ip_names()
+    out = []
+    for line in lines:
+        a = ACCESS_RE.match(line)
+        if not a:
+            continue
+        ts, _src, proto, host, port, route = a.groups()
+        if not route.startswith("tun"):
+            continue
+        outbound = DETOUR_RE.split(route.strip())[-1]
+        if outbound == "dns-out":
+            continue
+        host = host.strip("[]")
+        if host.startswith(("ff0", "224.", "239.", "255.")):
+            continue  # mDNS, SSDP and other broadcast: noise
+        name = ip_name.get(host, host)
+        out.append({"time": ts.split()[1][:8], "host": name, "ip": host,
+                    "port": int(port), "proto": proto,
+                    "via": "direct" if outbound == "direct" else "block" if outbound == "block" else "tunnel",
+                    "node": names.get(outbound, outbound),
+                    "rule": rule_for(name, host, rules)})
+    # One host, one row with a connection count: the picture is useful, not every socket.
+    folded, index = [], {}
+    for item in reversed(out):
+        key = (item["host"], item["via"])
+        if key in index:
+            index[key]["count"] += 1
+            continue
+        item["count"] = 1
+        index[key] = item
+        folded.append(item)
+    return folded[:limit]
+
+
+# Warnings that are not errors: the core starting and deprecated settings.
+ERROR_NOISE = ("core: Xray", "is deprecated", "deprecated, not recommended")
+
+
+def recent_errors(limit=15):
+    # The session number "[3301886461] " in a line is internal and gets in the way.
+    return [re.sub(r"\[\d{6,}\] ", "", l) for l in tail(ERROR_LOG, 400)
+            if ("[Warning]" in l or "[Error]" in l) and not any(n in l for n in ERROR_NOISE)][-limit:]
+
+
+PROTECTION_TEXT = {
+    "core_stopped": "core is not running",
+    "no_tun": "no device " + DEV,
+    "not_routed": "traffic is not routed into the tunnel",
+    "killswitch_off": "killswitch is off",
+    "killswitch_unknown": "killswitch state is unknown",
+    "killswitch_tampered": "the killswitch table was changed after it was loaded",
+    "dns_bypass": "DNS bypasses the core",
+}
+
+
+def protection(running, tun, killswitch, dns, service=""):
+    """One "protected" verdict and the list of what is wrong, for the panel's header."""
+    codes = []
+    if not running and service == "activating" and net_failure() in ("not_routed", "no_tun", "foreign_tun"):
+        # `net up` failed and systemd is starting the unit again: the core
+        # runs between attempts, but traffic does not go into the tunnel.
+        codes.append("not_routed")
+    elif not running:
+        codes.append("core_stopped")
+    elif not tun:
+        codes.append("no_tun")
+    elif "%d:" % PREF_TUN not in run(["ip", "rule"]).stdout:
+        codes.append("not_routed")
+    if killswitch != "on":
+        codes.append({"off": "killswitch_off", "tampered": "killswitch_tampered"}.get(killswitch,
+                                                                                    "killswitch_unknown"))
+    if dns != "xray":
+        codes.append("dns_bypass")
+    # problems is text for the terminal; the panel translates the codes itself.
+    return {"ok": not codes, "codes": codes, "problems": [PROTECTION_TEXT[c] for c in codes]}
+
+
+def exit_info(refresh=False):
+    info = read_json(EXIT_FILE, {})
+    if refresh or time.time() - info.get("ts", 0) > 600:
+        try:
+            with urllib.request.urlopen("https://1.1.1.1/cdn-cgi/trace", timeout=8) as resp:
+                kv = dict(l.split("=", 1) for l in read_limited(resp, 16384).decode().splitlines() if "=" in l)
+            info = {"ip": kv.get("ip"), "country": kv.get("loc"), "ts": int(time.time())}
+        except Exception:
+            info = {"ip": None, "country": None, "ts": int(time.time())}
+        write_json(EXIT_FILE, info)
+    return info
+
+
+def node_alive(node, obs):
+    """True: at least one node exit is alive; False: all probed and dead; None: not probed."""
+    tags = [o["tag"] for o in node["outbounds"]]
+    probed = [t for t in tags if t in obs]
+    if not probed:
+        return None
+    return any(obs[t].get("alive") for t in probed)
+
+
+def node_table(nodes, m):
+    obs = (m or {}).get("observatory") or {}
+    stats = ((m or {}).get("stats") or {}).get("outbound") or {}
+    rows = []
+    for n in nodes:
+        tags = [o["tag"] for o in n["outbounds"]]
+        delays = [obs[t]["delay"] for t in tags if t in obs and obs[t].get("alive")]
+        probed = any(t in obs for t in tags)
+        traffic = sum(stats.get(t, {}).get("uplink", 0) + stats.get(t, {}).get("downlink", 0) for t in tags)
+        rows.append({"id": n["id"], "name": n["name"], "kind": n["kind"], "members": len(tags),
+                     "delay": min(delays) if delays else None,
+                     "alive": bool(delays) if probed else None, "traffic": traffic})
+    return rows
+
+
+def notify_enabled():
+    return bool(read_json(SETTINGS_FILE, {}).get("notify", True))
+
+
+def gather(with_nodes=False, refresh_exit=False):
+    subs, selection, sid, nodes = active_nodes()
+    running = service_active()
+    m = metrics() if running else None
+    names = {}
+    tag_ids = {}
+    for n in nodes:
+        for o in n["outbounds"]:
+            names[o["tag"]] = n["name"]
+            tag_ids[o["tag"]] = n["id"]
+    today, rate = account_traffic(m) if m else (read_json(TRAFFIC_FILE, {}).get("days", {}).get(time.strftime("%F"), {}), {})
+    _, chosen = target_for(selection, nodes)
+    fallback = fallback_status(selection, nodes, running)
+    current = None
+    current_id = None
+    if running:
+        if chosen and fallback["ready"] and fallback["active"] is not None:
+            # The node pinned actually uses: primary or fallback.
+            pick = fallback["pick"] or (selection["fallback"]["node"] and
+                                        {n["id"]: n for n in nodes}[selection["fallback"]["node"]]["target"])
+            current = names.get(pick, pick)
+            current_id = tag_ids.get(pick)
+        elif chosen:
+            current = chosen["name"]
+            current_id = chosen["id"]
+        else:
+            _, pick = balancer_pick("auto")
+            current = names.get(pick, pick)
+            current_id = tag_ids.get(pick)
+    del fallback["pick"]
+    sub_rows = []
+    for s in subs:
+        meta = read_json(os.path.join(SUBS_CACHE, sub_id(s) + ".meta.json"), {})
+        sub_rows.append({"name": s["name"], "active": sub_id(s) == sid, "count": meta.get("count", 0),
+                         "updated": meta.get("updated"), "title": meta.get("title"),
+                         "userinfo": meta.get("userinfo") or {}, "skipped": meta.get("skipped") or []})
+    rules = load_rules()
+    state = {
+        "running": running,
+        "service": run(["systemctl", "--user", "is-active", UNIT]).stdout.strip(),
+        "tun": os.path.exists("/sys/class/net/" + DEV),
+        "killswitch": killswitch_state(),
+        "dns": dns_state(),
+        "mode": "node" if chosen else "auto",
+        "selected": chosen["id"] if chosen else None,
+        "current": current,
+        # Node names repeat in a big subscription; the plugin needs the id of the node
+        # carrying traffic now, to mark it in the list.
+        "current_id": current_id,
+        "fallback": fallback,
+        "exit": exit_info(refresh_exit) if running else {},
+        "traffic": {"today": today, "rate": rate},
+        "subscriptions": sub_rows,
+        "recent": recent_connections(names, rules=rules) if running else [],
+        "rules": rules,
+        "notify": notify_enabled(),
+        "presets": preset_state(),
+        "network": network_status(),
+        "errors": recent_errors() if running else [],
+        "time": int(time.time()),
+    }
+    state["protection"] = protection(running, state["tun"], state["killswitch"], state["dns"], state["service"])
+    # Settings or network values left out of the killswitch (not local networks).
+    state["warnings"] = killswitch_args(network())[1]
+    state["setup"] = setup_state()
+    if with_nodes:
+        state["nodes"] = node_table(nodes, m)
+    return state
+
+
+def setup_state():
+    """What the tunnel needs installed: the root helper, the xray core with its
+    capabilities and the geo files. ready only when all are there. version is
+    this package's: the panel offers "Update components…" when it is older
+    than the panel."""
+    try:
+        caps = bool(os.getxattr(os.path.realpath(XRAY), "security.capability"))
+    except OSError:
+        caps = False
+    core = os.access(XRAY, os.X_OK)
+    helper_ok = os.access(HELPER, os.X_OK)
+    geo = all(os.path.exists(os.path.join(ASSET_DIR, n)) or os.path.exists(os.path.join(SYSTEM_GEO_DIR, n))
+              for n in GEO_FILES)
+    return {"version": VERSION, "helper": helper_ok, "core": core, "core_caps": caps, "geo": geo,
+            "ready": helper_ok and core and caps and geo}
+
+
+def human_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1024
+
+
+def cmd_status(args):
+    state = gather(with_nodes=args.nodes, refresh_exit=args.refresh)
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False))
+        return 0
+    t = state["traffic"]["today"] or {}
+    r = state["traffic"]["rate"] or {}
+    ex = state["exit"] or {}
+    fb = state["fallback"]
+    print("core:        %s" % state["service"])
+    print("device:      %s" % (DEV if state["tun"] else "none"))
+    print("killswitch:  %s" % state["killswitch"])
+    print("system DNS:  %s" % state["dns"])
+    print("mode:        %s" % ("auto" if state["mode"] == "auto" else "manual node"))
+    print("node:        %s" % (state["current"] or "-"))
+    print("fallback:    %s%s%s" % ("on" if fb["enabled"] else "off",
+                                   ", node " + fb["node_name"] if fb["node_name"] else "",
+                                   ", IN USE" if fb["active"] else ""))
+    print("exit:        %s %s" % (ex.get("ip") or "-", ex.get("country") or ""))
+    print("speed:       down %s/s  up %s/s" % (human_bytes(r.get("tunnel_down", 0) + r.get("direct_down", 0)),
+                                              human_bytes(r.get("tunnel_up", 0) + r.get("direct_up", 0))))
+    print("today:       tunnel down %s up %s, direct down %s up %s" % (
+        human_bytes(t.get("tunnel_down")), human_bytes(t.get("tunnel_up")),
+        human_bytes(t.get("direct_down")), human_bytes(t.get("direct_up"))))
+    for s in state["subscriptions"]:
+        print("subscription: %s%s, %d nodes" % ("* " if s["active"] else "  ", s["name"], s["count"]))
+    if not state["protection"]["ok"]:
+        print("NOT PROTECTED: %s" % ", ".join(state["protection"]["problems"]))
+    for w in state["warnings"]:
+        print("warning:     %s" % w)
+    if args.nodes:
+        for n in sorted(state["nodes"], key=lambda n: (n["delay"] is None, n["delay"] or 0)):
+            print("  %s  %-6s %s" % (n["id"], "%dms" % n["delay"] if n["delay"] else "-", n["name"]))
+    for e in state["errors"][-5:]:
+        print("error:       %s" % e[:150])
+    return 0
+
+
+def cmd_trim(args):
+    """Every few minutes from a timer: accumulates traffic and keeps the logs in tmpfs from growing."""
+    if service_active():
+        account_traffic(metrics())
+    for path, keep in ((ACCESS_LOG, 3000), (ERROR_LOG, 500)):
+        try:
+            if os.path.getsize(path) > 2_000_000:
+                lines = tail(path, keep, max_bytes=1_000_000)
+                # The core writes with O_APPEND, so truncating in place is safe.
+                with open(path, "r+", encoding="utf8") as fh:
+                    fh.truncate(0)
+                with open(path, "a", encoding="utf8") as fh:
+                    fh.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------- per-site rules: commands
+
+def cmd_rule(args):
+    rules = load_rules()
+    if args.action == "list":
+        if args.json:
+            print(json.dumps(rules, ensure_ascii=False))
+        else:
+            for side in ("direct", "tunnel"):
+                for host in rules[side]:
+                    print("%-7s %s" % (side, host))
+        return 0
+    if args.action == "add":
+        if args.side not in ("direct", "tunnel") or not args.host:
+            return finish(args, False, "usage", "", "usage: xray-omarchy rule add direct|tunnel HOST")
+        host, _ = normalize_host(args.host)
+        if not host:
+            return finish(args, False, "invalid_host", args.host,
+                          "not a domain or IPv4 address: %s" % args.host)
+        for side in ("direct", "tunnel"):
+            rules[side] = [h for h in rules[side] if h != host]
+        rules[args.side].append(host)
+        text = "rule: %s -> %s" % (host, args.side)
+    else:
+        host, _ = normalize_host(args.side)  # rm HOST: the host is the first argument
+        if not host or not any(host in rules[s] for s in rules):
+            return finish(args, False, "not_found", args.side or "", "no rule for %s" % args.side)
+        for side in ("direct", "tunnel"):
+            rules[side] = [h for h in rules[side] if h != host]
+        text = "rule removed: %s" % host
+    write_json(RULES_FILE, rules)
+    cmd_build(None)
+    if not service_active():
+        return finish(args, True, "", host, text)
+    subs, selection, sid, nodes = active_nodes()
+    if not push_rules(selection, nodes):
+        return finish(args, False, "apply_failed", host,
+                      text + "; saved, but the running core did not accept the rules (applies on restart)")
+    return finish(args, True, "", host, text + " (applied live)")
+
+
+def cmd_notify(args):
+    settings = read_json(SETTINGS_FILE, {})
+    if args.action in ("on", "off"):
+        settings["notify"] = args.action == "on"
+        write_json(SETTINGS_FILE, settings)
+    state = "on" if settings.get("notify", True) else "off"
+    return finish(args, True, "", state, "notifications: %s" % state)
+
+
+def preset_state(st=None):
+    """{name: on} — a preset is on when all of its entries are in direct_geo."""
+    geo = (st or load_settings())["direct_geo"]
+    return {name: all(item in geo.get(key, []) for key, items in preset.items() for item in items)
+            for name, preset in PRESETS.items()}
+
+
+def cmd_preset(args):
+    """Presets add their lists to direct_geo in settings.json or take them out.
+    The DNS servers of the config change with them, so a running core picks
+    the change up only on restart: --apply restarts it (the panel asks first)."""
+    if args.name == "list":
+        state = preset_state()
+        if args.json:
+            print(json.dumps(state))
+        else:
+            for name, on in state.items():
+                print("%-10s %s" % (name, "on" if on else "off"))
+        return 0
+    if args.action not in ("on", "off"):
+        return finish(args, False, "usage", "", "usage: xray-omarchy preset NAME on|off [--apply]")
+    on = args.action == "on"
+    raw = read_json(SETTINGS_FILE, {})
+    raw = raw if isinstance(raw, dict) else {}
+    geo = load_settings()["direct_geo"]
+    for key, items in PRESETS[args.name].items():
+        current = list(geo.get(key) or [])
+        geo[key] = current + [i for i in items if i not in current] if on else [i for i in current if i not in items]
+    raw["direct_geo"] = geo
+    write_json(SETTINGS_FILE, raw)
+    text = "preset %s: %s" % (args.name, args.action)
+    cmd_build(None)
+    if not service_active():
+        return finish(args, True, "", args.action, text + " (core is not running, applies on start)")
+    if args.apply:
+        run(["systemctl", "--user", "restart", UNIT], timeout=60)
+        return finish(args, True, "restarted", args.action, text + "; core restarted")
+    return finish(args, True, "restart_needed", args.action,
+                  text + "; applies on core restart: run again with --apply")
+
+
+# ---------------------------------------------------------------- notifications
+
+WATCH_INTERVAL = 10
+KILLSWITCH_EVERY = 30  # the helper less often: every sudo call is lines in the journal
+DAY = 86400
+
+
+def markup_escape(text):
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def send_notification(summary, body, urgency="normal"):
+    """notify-send with app-name xray-omarchy. Foreign strings only as arguments,
+    with markup escaped in the text."""
+    r = subprocess.run(["notify-send", "-a", "xray-omarchy", "-u", urgency, "--",
+                        summary, markup_escape(body)],
+                       capture_output=True, text=True, timeout=10)
+    log("notify (%s): %s | %s%s" % (urgency, summary, body, "" if r.returncode == 0 else " [failed]"))
+    return r.returncode == 0
+
+
+_ks_cache = {"t": 0, "v": "unknown"}
+
+
+def watch_snapshot():
+    """A narrow poll for watch: no exit address, no traffic accounting, no log."""
+    subs, selection, sid, nodes = active_nodes()
+    running = service_active()
+    tun = os.path.exists("/sys/class/net/" + DEV)
+    if time.time() - _ks_cache["t"] >= KILLSWITCH_EVERY:
+        _ks_cache.update(t=time.time(), v=killswitch_state())
+    prot = protection(running, tun, _ks_cache["v"], dns_state())
+    m = metrics() if running else None
+    obs = (m or {}).get("observatory") or {}
+    by_id = {n["id"]: n for n in nodes}
+    node = None
+    if selection.get("mode") == "node" and selection.get("node") in by_id:
+        n = by_id[selection["node"]]
+        node = {"id": n["id"], "name": n["name"], "alive": node_alive(n, obs) if running else None}
+    fb = fallback_status(selection, nodes, running, with_restart=False) if running \
+        else {"ready": False, "active": None}
+    fb_node = (selection.get("fallback") or {}).get("node")
+    sub_rows = []
+    for s in subs:
+        meta = read_json(os.path.join(SUBS_CACHE, sub_id(s) + ".meta.json"), {})
+        ui = meta.get("userinfo") or {}
+        sub_rows.append({"name": s["name"], "expire": ui.get("expire", 0),
+                         "used": ui.get("upload", 0) + ui.get("download", 0), "total": ui.get("total", 0)})
+    return {"time": int(time.time()), "running": running,
+            "protection": {"ok": prot["ok"], "codes": prot["codes"]},
+            "node": node,
+            "fallback": {"ready": bool(fb.get("ready")), "active": fb.get("active"),
+                         "node_name": by_id[fb_node]["name"] if fb_node in by_id else None},
+            "subscriptions": sub_rows}
+
+
+def watch_events(snap, memory, daily, confirm):
+    """Compare a snapshot with memory; return events (code, urgency, summary, body).
+    Memory is what was already reported: one notification per change of state."""
+    events = []
+    now = snap.get("time") or int(time.time())
+
+    # Protection. A bad state must last `confirm` polls in a row: while the core
+    # starts and stops, protection is honestly incomplete for a second or two.
+    prot = snap.get("protection") or {}
+    if prot.get("ok", True):
+        memory["prot_streak"] = 0
+        if memory.get("protection") == "lost":
+            events.append(("protection_restored", "normal", "VPN protection restored",
+                           "Traffic goes through the tunnel again."))
+        memory["protection"] = "ok"
+    else:
+        memory["prot_streak"] = memory.get("prot_streak", 0) + 1
+        if memory["prot_streak"] >= confirm and memory.get("protection") != "lost":
+            text = ", ".join(PROTECTION_TEXT.get(c, c) for c in prot.get("codes") or [])
+            events.append(("protection_lost", "critical", "VPN protection lost", text + "."))
+            memory["protection"] = "lost"
+
+    # The selected node. Not probed (None): unknown, change nothing.
+    node = snap.get("node")
+    if node:
+        if memory.get("node_id") != node.get("id"):
+            memory.update(node_id=node.get("id"), node_state="alive", node_streak=0)
+        alive = node.get("alive")
+        if alive is True:
+            memory["node_streak"] = 0
+            if memory.get("node_state") == "dead":
+                events.append(("node_up", "normal", "VPN node is back", "%s answers again." % node["name"]))
+            memory["node_state"] = "alive"
+        elif alive is False:
+            memory["node_streak"] = memory.get("node_streak", 0) + 1
+            if memory["node_streak"] >= confirm and memory.get("node_state") != "dead":
+                events.append(("node_down", "normal", "VPN node is down",
+                               "%s does not answer health checks." % node["name"]))
+                memory["node_state"] = "dead"
+    else:
+        memory.update(node_id=None, node_state="alive", node_streak=0)
+
+    # Fallback node. Right after a start the core has not probed the primary yet and
+    # honestly sends traffic to the fallback; that is not an event, so `confirm` polls here too.
+    fb = snap.get("fallback") or {}
+    if fb.get("ready") and fb.get("active") is not None:
+        memory["fb_streak"] = memory.get("fb_streak", 0) + 1 if fb["active"] else 0
+        if fb["active"] and memory["fb_streak"] >= confirm and memory.get("fallback") != "active":
+            events.append(("fallback_engaged", "normal", "Switched to fallback node",
+                           "%s is down, traffic goes via %s." % ((node or {}).get("name") or "Selected node",
+                                                                 fb.get("node_name") or "the fallback node")))
+            memory["fallback"] = "active"
+        elif not fb["active"] and memory.get("fallback") == "active":
+            events.append(("primary_restored", "normal", "Back on primary node",
+                           "Traffic goes via %s again." % ((node or {}).get("name") or "the selected node")))
+            memory["fallback"] = "idle"
+    elif not fb.get("ready"):
+        memory.update(fallback="idle", fb_streak=0)
+
+    # Subscriptions: at most once a day per subscription and event.
+    for s in snap.get("subscriptions") or []:
+        name = s.get("name") or "?"
+        expire = s.get("expire") or 0
+        if expire > 0 and expire - now <= 3 * DAY and now - daily.get("expire:" + name, 0) >= DAY:
+            when = time.strftime("%Y-%m-%d", time.localtime(expire))
+            left = expire - now
+            body = ("%s expired on %s." % (name, when) if left <= 0 else
+                    "%s expires in %s (%s)." % (name, "%d h" % max(1, left // 3600) if left < DAY
+                                                else "%d days" % (left // DAY), when))
+            events.append(("sub_expiring", "normal", "Subscription expires soon", body))
+            daily["expire:" + name] = now
+        total, used = s.get("total") or 0, s.get("used") or 0
+        if total > 0 and used >= 0.9 * total and now - daily.get("traffic:" + name, 0) >= DAY:
+            events.append(("sub_traffic", "normal", "Subscription traffic almost used",
+                           "%s: %s of %s used (%d%%)." % (name, human_bytes(used), human_bytes(total),
+                                                         100 * used // total)))
+            daily["traffic:" + name] = now
+    return events
+
+
+def cmd_watch(args):
+    fake = args.state_file is not None
+    # A test run (--state-file) keeps its memory next to the fake state and leaves the real one alone.
+    mem_path = args.memory or (args.state_file + ".memory.json" if fake else WATCH_FILE)
+    daily_path = mem_path if fake else WATCH_DAILY
+    confirm = 1 if fake else 2
+    while True:
+        try:
+            snap = read_json(args.state_file, None) if fake else watch_snapshot()
+            if snap is None:
+                raise ValueError("cannot read state file %s" % args.state_file)
+            memory = read_json(mem_path, {})
+            daily = read_json(daily_path, {}) if not fake else memory.setdefault("daily", {})
+            events = watch_events(snap, memory, daily, confirm)
+            sent = []
+            enabled = notify_enabled()
+            for code, urgency, summary, body in events:
+                ok = send_notification(summary, body, urgency) if enabled else False
+                sent.append({"event": code, "urgency": urgency, "summary": summary, "body": body,
+                             "sent": ok})
+            write_json(mem_path, memory)
+            if not fake:
+                write_json(daily_path, daily)
+            if args.once:
+                if args.json:
+                    print(json.dumps({"events": sent, "notify": enabled}, ensure_ascii=False))
+                else:
+                    for e in sent:
+                        print("%s: %s | %s%s" % (e["event"], e["summary"], e["body"],
+                                                 "" if e["sent"] else " (not sent)"))
+                    if not sent:
+                        print("no events")
+                return 0
+        except Exception as error:
+            if args.once:
+                print("watch failed: %s" % error, file=sys.stderr)
+                return 1
+            log("watch: %s" % error)
+        time.sleep(WATCH_INTERVAL)
+
+
+# ---------------------------------------------------------------- xray core: update
+
+CORE_CODES = ("ok", "up_to_date", "download_failed", "checksum_mismatch", "config_rejected",
+              "stage_failed", "stage_busy", "no_space", "not_pinned", "rolled_back", "started", "in_progress",
+              "check_failed")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def version_tuple(text):
+    return tuple(int(x) for x in re.findall(r"\d+", text or "")[:4])
+
+
+def xray_version(binary=None):
+    try:
+        out = run([binary or XRAY, "version"], timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r"Xray (\d+(?:\.\d+)+)", out)
+    return m.group(1) if m else None
+
+
+def http_get(url, limit, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": "xray-omarchy", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return read_limited(resp, limit)
+
+
+def check_release_url(url):
+    """A core comes only from XTLS's own releases. GitHub redirects the download
+    to its file host; the link asked for must be this one."""
+    if not isinstance(url, str) or not url.startswith(RELEASE_DOWNLOAD) \
+            or re.search(r"[^\x21-\x7e]|\.\.|[?#]", url):
+        raise ValueError("not an XTLS release link: %r" % str(url)[:120])
+    return url
+
+
+def release_version(tag):
+    """The version from a release tag (v26.11.9), checked before it is used anywhere."""
+    m = TAG_RE.fullmatch(tag) if isinstance(tag, str) else None
+    if not m:
+        raise ValueError("unexpected release tag %r" % str(tag)[:40])
+    return m.group(1)
+
+
+def pinned_versions():
+    """{version: SHA-256 of the zip} this package pins for this machine."""
+    data = read_json(CORE_SUMS, {})
+    versions = data.get("versions") if isinstance(data, dict) else None
+    arch = platform.machine()
+    out = {}
+    for ver, entry in (versions.items() if isinstance(versions, dict) else []):
+        sha = entry.get(arch) if isinstance(entry, dict) else None
+        if isinstance(ver, str) and TAG_RE.fullmatch(ver) and not ver.startswith("v") \
+                and isinstance(sha, str) and SHA256_RE.fullmatch(sha):
+            out[ver] = sha
+    return out
+
+
+def newest_pinned(pins=None):
+    pins = pinned_versions() if pins is None else pins
+    return max(pins, key=version_tuple) if pins else None
+
+
+def core_url(version):
+    return check_release_url("%sv%s/%s" % (RELEASE_DOWNLOAD, version, RELEASE_ASSET))
+
+
+def latest_release(refresh=False):
+    """The newest XTLS release, cached for a day (the API allows 60 requests an
+    hour). For information only: `core update` installs the newest pinned one."""
+    state = read_json(CORE_STATE, {})
+    latest = state.get("latest") or {}
+    if not refresh and latest.get("version") and time.time() - latest.get("checked", 0) < DAY:
+        return latest, None
+    try:
+        data = json.loads(http_get(RELEASE_API, API_MAX, timeout=20))
+        if not isinstance(data, dict):
+            raise ValueError("unexpected answer from the release API")
+        version = release_version(data.get("tag_name"))
+        assets = {a.get("name"): a.get("browser_download_url")
+                  for a in data.get("assets") or [] if isinstance(a, dict)}
+        if RELEASE_ASSET not in assets:
+            raise ValueError("release %s has no %s" % (version, RELEASE_ASSET))
+        check_release_url(assets[RELEASE_ASSET])
+        published = data.get("published_at")
+        latest = {"version": version,
+                  "published": published if isinstance(published, str) and len(published) <= 40 else None,
+                  "checked": int(time.time())}
+        state = read_json(CORE_STATE, {})
+        state["latest"] = latest
+        state.pop("check_error", None)
+        write_json(CORE_STATE, state)
+        return latest, None
+    except Exception as error:
+        state = read_json(CORE_STATE, {})
+        state["check_error"] = str(error)[:200]
+        state.pop("latest", None)
+        write_json(CORE_STATE, state)
+        return None, str(error)[:200]
+
+
+def update_running():
+    return run(["systemctl", "--user", "is-active", "--quiet", CORE_UPDATE_UNIT + ".service"]).returncode == 0
+
+
+def core_status_data(refresh=False):
+    current = xray_version()
+    pins = pinned_versions()
+    target = newest_pinned(pins)
+    latest, error = latest_release(refresh)
+    state = read_json(CORE_STATE, {})
+    update = state.get("update")
+    if update and update.get("state") == "running" and not update_running() \
+            and time.time() - update.get("started", 0) > 300:
+        update = dict(update, state="lost")  # the detached process vanished without a result
+    release = (latest or {}).get("version")
+    available = None
+    if target:
+        available = version_tuple(target) > version_tuple(current) if current else True
+    return {"version": current, "path": XRAY,
+            # What can be installed: the newest version this package pins.
+            "latest": target, "pinned": sorted(pins, key=version_tuple, reverse=True),
+            "latest_published": (latest or {}).get("published") if release == target else None,
+            "latest_checked": (latest or {}).get("checked"),
+            # The newest XTLS release; newer than "latest" means it comes with a package update.
+            "release": release,
+            "release_pinned": (release in pins) if release else None,
+            "update_available": available,
+            "check_error": error,
+            "prev": os.path.exists(XRAY_PREV),
+            "prev_version": xray_version(XRAY_PREV) if os.path.exists(XRAY_PREV) else None,
+            "in_progress": bool(update and update.get("state") == "running"),
+            "update": update}
+
+
+def record_update(**fields):
+    state = read_json(CORE_STATE, {})
+    update = state.get("update") or {}
+    update.update(fields)
+    state["update"] = update
+    write_json(CORE_STATE, state)
+    return update
+
+
+def core_result(args, ok, code, detail, text, **extra):
+    say(text)
+    if getattr(args, "json", False):
+        print(json.dumps(dict({"ok": ok, "code": code, "detail": detail}, **extra), ensure_ascii=False))
+    return 0 if ok else 1
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def core_download(version, sha):
+    """The pinned zip of VERSION in the cache, downloaded unless a copy with the
+    pinned sum is already there. (path, code, detail)."""
+    folder = os.path.join(CORE_CACHE, version)
+    path = os.path.join(folder, RELEASE_ASSET)
+    try:
+        if os.path.isfile(path) and not os.path.islink(path) and file_sha256(path) == sha:
+            return path, "", "cached"
+    except OSError:
+        pass
+    try:
+        data = http_get(core_url(version), CORE_ZIP_MAX, timeout=300)
+    except Exception as error:
+        return None, "download_failed", str(error)[:200]
+    got = hashlib.sha256(data).hexdigest()
+    if got != sha:
+        return None, "checksum_mismatch", "expected %s, got %s" % (sha, got)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    write_private(path, data, binary=True)
+    return path, "", "downloaded"
+
+
+def core_stage(version, sha):
+    """Download (as this user), then the helper copies the zip into root's
+    directory, checks the pinned SHA-256 on its copy and takes the binary out.
+    (code, detail): code "" when staged."""
+    path, code, detail = core_download(version, sha)
+    if code:
+        return code, detail
+    r = helper("core", "stage", version, path)
+    if r.returncode in (3, 5, 6):
+        # 3: the sum does not match; 5: another stage is running; 6: no free space.
+        return ({3: "checksum_mismatch", 5: "stage_busy", 6: "no_space"}[r.returncode],
+                (r.stderr.strip() or r.stdout.strip())[:200])
+    if r.returncode != 0:
+        return "stage_failed", (r.stderr.strip() or r.stdout.strip())[:200]
+    return "", detail
+
+
+def staged_binary(version):
+    return os.path.join(CORE_DIR, version, "xray")
+
+
+def core_caps_ok(path=None):
+    caps = run(["getcap", os.path.realpath(path or XRAY)]).stdout
+    return "cap_net_admin" in caps and "cap_net_bind_service" in caps
+
+
+def cmd_core(args):
+    if args.action == "status":
+        data = core_status_data(refresh=args.refresh)
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False))
+        else:
+            print("xray:        %s (%s)" % (data["version"] or "not installed", data["path"]))
+            print("installable: %s%s (pinned: %s)" % (data["latest"] or "none",
+                                                      ", update available" if data["update_available"] else "",
+                                                      ", ".join(data["pinned"]) or "none"))
+            print("release:     %s%s" % (data["release"] or "unknown",
+                                         ", not pinned yet: comes with a package update"
+                                         if data["release_pinned"] is False else ""))
+            if data["check_error"]:
+                print("check error: %s" % data["check_error"])
+            u = data["update"]
+            if u:
+                print("last update: %s %s -> %s: %s %s" % (u.get("state"), u.get("from"), u.get("to"),
+                                                           u.get("code") or "", u.get("detail") or ""))
+        return 0
+    if args.action == "install":
+        return core_install(args)
+    # update
+    if update_running():
+        return core_result(args, False, "in_progress", "", "a core update is already running")
+    current = xray_version()
+    pins = pinned_versions()
+    if not pins:
+        return core_result(args, False, "check_failed", CORE_SUMS,
+                           "no pinned xray versions for %s in %s" % (platform.machine(), CORE_SUMS))
+    if args.to:
+        m = TAG_RE.fullmatch(args.to)
+        target = m.group(1) if m else None
+        if target not in pins:
+            return core_result(args, False, "not_pinned", str(args.to)[:40],
+                               "xray %s is not pinned by this package (pinned: %s)" % (
+                                   str(args.to)[:40], ", ".join(sorted(pins, key=version_tuple, reverse=True))),
+                               version=current, latest=newest_pinned(pins))
+    else:
+        target = newest_pinned(pins)
+    latest, _ = latest_release(refresh=True)
+    release = (latest or {}).get("version")
+    if not args.to and current and version_tuple(target) <= version_tuple(current) and not args.force:
+        if release and version_tuple(release) > version_tuple(current):
+            # A newer release exists, but no sum for it ships with this package.
+            return core_result(args, False, "not_pinned", release,
+                               "xray %s is out, but this package pins up to %s: update the package "
+                               "(the panel's Update components…)" % (release, target),
+                               version=current, latest=target, release=release)
+        return core_result(args, True, "up_to_date", current, "xray %s is the latest" % current,
+                           version=current, latest=target)
+    code, detail = core_stage(target, pins[target])
+    if code:
+        return core_result(args, False, code, detail, "update failed (%s): %s" % (code, detail),
+                           version=current, latest=target)
+    binary = staged_binary(target)
+    # No config yet (first install): nothing for the new core to reject.
+    ok, err = xray_test(CONFIG_FILE, binary=binary) if os.path.exists(CONFIG_FILE) else (True, "")
+    if not ok:
+        return core_result(args, False, "config_rejected", err,
+                           "xray %s rejects the current config: %s" % (target, err),
+                           version=current, latest=target)
+    if args.dry_run:
+        return core_result(args, True, "ok", "verified, not activated (dry run)",
+                           "xray %s staged in %s, sha256 %s pinned and matching, config OK (dry run)" % (
+                               target, os.path.dirname(binary), pins[target][:16]),
+                           dry_run=True, version=current, latest=target, staged=binary, sha256=pins[target])
+    if not os.path.exists(XRAY):
+        return core_first_install(args, target, pins[target])
+    if current == target:
+        # The same version again (lost capabilities, say): the helper set them
+        # anew on the file in place; nothing to switch or restart.
+        ok = core_caps_ok()
+        return core_result(args, ok, "ok" if ok else "stage_failed", "reinstalled" if ok else "no capabilities",
+                           "xray %s reinstalled in place%s" % (target, "" if ok else ", but without capabilities"),
+                           version=current, latest=target)
+    # Restarting the core cuts the connection: a detached service does the swap, the result goes to core.json.
+    record_update(state="running", code="", ok=None, detail="", started=int(time.time()), finished=None,
+                  **{"from": current, "to": target})
+    env_args = []
+    for key, value in os.environ.items():
+        if key.startswith("XRAY_OMARCHY_"):
+            env_args += ["-E", "%s=%s" % (key, value)]
+    r = run(["systemd-run", "--user", "--quiet", "--collect", "--unit=" + CORE_UPDATE_UNIT, *env_args,
+             os.path.abspath(__file__), "core", "install", target, "--from-version", current or ""])
+    if r.returncode != 0:
+        record_update(state="done", ok=False, code="in_progress", detail=r.stderr.strip()[:200],
+                      finished=int(time.time()))
+        return core_result(args, False, "in_progress", r.stderr.strip()[:200], "cannot start the update job")
+    return core_result(args, True, "started", "see xray-omarchy core status",
+                       "installing xray %s in the background (unit %s); result: xray-omarchy core status" % (
+                           target, CORE_UPDATE_UNIT),
+                       version=current, latest=target)
+
+
+def core_first_install(args, version, sha):
+    """No core yet: nothing runs and nothing to roll back to, so the staged core
+    becomes the current one right here, without the detached unit."""
+    r = helper("core", "activate", version)
+    ok = r.returncode == 0 and core_caps_ok()
+    why = "" if ok else ((r.stderr.strip() or r.stdout.strip() or "no capabilities on %s" % XRAY)[:200])
+    now = int(time.time())
+    record_update(state="done", ok=ok, code="ok" if ok else "stage_failed", detail=why,
+                  started=now, finished=now, **{"from": None, "to": version})
+    if not ok:
+        return core_result(args, False, "stage_failed", why, "xray %s was not activated: %s" % (version, why),
+                           version=xray_version(), latest=version)
+    return core_result(args, True, "ok", "installed",
+                       "xray %s installed to %s (zip sha256 %s, pinned), capabilities set" % (
+                           version, os.path.dirname(os.path.realpath(XRAY)), sha[:16]),
+                       version=version, latest=version, sha256=sha)
+
+
+def core_health(deadline=20):
+    """The service is active, xray-omarchy0 exists, ip rule 9110 is set, 204 from generate_204."""
+    end = time.time() + deadline
+    why = "not checked"
+    while time.time() < end:
+        if not service_active():
+            why = "service not active"
+        elif not CORE_PROXY and not os.path.exists("/sys/class/net/" + DEV):
+            why = "no device " + DEV
+        elif not CORE_PROXY and "%d:" % PREF_TUN not in run(["ip", "rule"]).stdout:
+            why = "no ip rule %d" % PREF_TUN
+        else:
+            cmd = ["curl", "-s", "-o", "/dev/null", "-m", "5", "-w", "%{http_code}", PROBE_URL]
+            if CORE_PROXY:
+                cmd[1:1] = ["--proxy", CORE_PROXY]
+            try:
+                code = run(cmd, timeout=8).stdout.strip()
+            except subprocess.TimeoutExpired:
+                code = "timeout"
+            if code == "204":
+                return True, ""
+            why = "probe answered %s" % (code or "nothing")
+        time.sleep(1)
+    return False, why
+
+
+def core_install(args):
+    """The detached part of an update: switch current, restart, health check, rollback.
+    The helper keeps the previous version (core/previous) until the next update."""
+    m = TAG_RE.fullmatch(args.target or "")
+    if not m:
+        return core_result(args, False, "stage_failed", "bad version", "bad version: %r" % args.target)
+    to_ver = m.group(1)
+    from_ver = args.from_version or xray_version()
+
+    def done(ok, code, detail, text):
+        record_update(state="done", ok=ok, code=code, detail=detail, finished=int(time.time()),
+                      **{"from": from_ver, "to": to_ver})
+        return core_result(args, ok, code, detail, text)
+
+    record_update(state="running", started=int(time.time()), code="", ok=None, detail="",
+                  **{"from": from_ver, "to": to_ver})
+    r = helper("core", "activate", to_ver)
+    if r.returncode != 0:
+        why = (r.stderr.strip() or r.stdout.strip())[:200]
+        return done(False, "stage_failed", why, "xray %s was not activated (%s)" % (to_ver, why))
+    run(["systemctl", "--user", "restart", UNIT], timeout=60)
+    healthy, why = core_health()
+    if healthy:
+        return done(True, "ok", "", "xray %s installed, tunnel is healthy" % to_ver)
+    back = False
+    why_back = "no previous version"
+    # Back to what the helper kept as previous: the version that ran before.
+    prev = os.path.basename(os.path.dirname(os.path.realpath(XRAY_PREV))) if os.path.exists(XRAY_PREV) else ""
+    prev = prev if TAG_RE.fullmatch(prev) and prev != to_ver else ""
+    if prev:
+        # rollback, not activate: core/previous then points to the version that
+        # ran before prev, not to the one that just failed.
+        if helper("core", "rollback", prev).returncode == 0:
+            from_ver = prev
+            run(["systemctl", "--user", "restart", UNIT], timeout=60)
+            back, why_back = core_health()
+        else:
+            why_back = "previous version not accepted"
+    detail = "new core: %s; rollback: %s" % (why, "healthy" if back else why_back)
+    return done(False, "rolled_back", detail, "xray %s failed (%s), rolled back to %s" % (to_ver, why, from_ver))
+
+
+# ---------------------------------------------------------------- entry point
+
+def main():
+    p = argparse.ArgumentParser(prog=NAME, description=__doc__.split("\n")[0])
+    p.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    sp = p.add_subparsers(dest="cmd")
+    s = sp.add_parser("status", help="state")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--nodes", action="store_true", help="with the node list and delays")
+    s.add_argument("--refresh", action="store_true", help="re-check the exit address")
+    s = sp.add_parser("on", help="bring the tunnel up")
+    s.add_argument("--json", action="store_true", help="result as one JSON {ok, code, detail}")
+    s = sp.add_parser("off", help="take the tunnel down, direct exit")
+    s.add_argument("--json", action="store_true", help="result as one JSON {ok, code, detail}")
+    s = sp.add_parser("select", help="select a node by id, or auto")
+    s.add_argument("node")
+    s.add_argument("--json", action="store_true", help="result as one JSON {ok, code, detail}")
+    s = sp.add_parser("use", help="make a subscription active (xray-omarchy use -- NAME)")
+    s.add_argument("name")
+    s.add_argument("--json", action="store_true", help="result as one JSON {ok, code, detail}")
+    s = sp.add_parser("update", help="update subscriptions")
+    s.add_argument("--name")
+    s.add_argument("--apply", action="store_true", help="restart the core if the active one changed")
+    s.add_argument("--json", action="store_true", help="per-subscription result as one JSON")
+    s = sp.add_parser("sub", help="subscriptions: list | add NAME URL [--ua UA] [--allow-http] | rm NAME")
+    s.add_argument("action", choices=["list", "add", "rm"])
+    s.add_argument("name", nargs="?")
+    s.add_argument("url", nargs="?")
+    s.add_argument("--ua")
+    s.add_argument("--allow-http", action="store_true",
+                   help="add: accept a plain http:// link (anyone on the way reads and can swap the nodes)")
+    s.add_argument("--json", action="store_true", help="add/rm: result as one JSON {ok, code, detail}")
+    sp.add_parser("build", help="build the core config")
+    s = sp.add_parser("net", help="routes into the TUN: up | down")
+    s.add_argument("action", choices=["up", "down"])
+    s = sp.add_parser("fw", help="killswitch (nftables table inet xray-omarchy): on | off")
+    s.add_argument("action", choices=["on", "off"])
+    s = sp.add_parser("dns", help="system DNS: on (core) | off (router)")
+    s.add_argument("action", choices=["on", "off"])
+    sp.add_parser("trim", help="internal: traffic accounting and log trimming")
+    s = sp.add_parser("preset", help="direct presets: list | russia on|off [--apply]")
+    s.add_argument("name", choices=["list"] + sorted(PRESETS))
+    s.add_argument("action", nargs="?", choices=["on", "off"])
+    s.add_argument("--apply", action="store_true", help="restart the core if it is running")
+    s.add_argument("--json", action="store_true", help="result as one JSON {ok, code, detail}")
+    s = sp.add_parser("fallback", help="fallback node: set ID | on | off [--apply]")
+    s.add_argument("action", choices=["set", "on", "off"])
+    s.add_argument("node", nargs="?")
+    s.add_argument("--apply", action="store_true", help="restart the core if the change needs it")
+    s.add_argument("--json", action="store_true", help="result as one JSON {ok, code, detail}")
+    s = sp.add_parser("rule", help="site rules: add direct|tunnel HOST | rm HOST | list")
+    s.add_argument("action", choices=["add", "rm", "list"])
+    s.add_argument("side", nargs="?", help="direct|tunnel for add; HOST for rm")
+    s.add_argument("host", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s = sp.add_parser("notify", help="desktop notifications: on | off | status")
+    s.add_argument("action", choices=["on", "off", "status"], nargs="?", default="status")
+    s.add_argument("--json", action="store_true")
+    s = sp.add_parser("watch", help="notify about tunnel events (service xray-omarchy-watch)")
+    s.add_argument("--once", action="store_true", help="one poll, print events, exit")
+    s.add_argument("--json", action="store_true", help="with --once: events as JSON")
+    s.add_argument("--state-file", help="test: read this JSON instead of the live state")
+    s.add_argument("--memory", help="test: dedup memory file (default next to --state-file)")
+    s = sp.add_parser("core", help="xray core: status | update [--to VERSION] [--dry-run]")
+    s.add_argument("action", choices=["status", "update", "install"])
+    s.add_argument("target", nargs="?", help=argparse.SUPPRESS)
+    s.add_argument("--to", help="update: this pinned version instead of the newest pinned one")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--refresh", action="store_true", help="status: re-check GitHub now")
+    s.add_argument("--dry-run", action="store_true", help="update: download, verify, test; do not install")
+    s.add_argument("--force", action="store_true", help="update: reinstall even if the version is not newer")
+    s.add_argument("--from-version", help=argparse.SUPPRESS)
+    args = p.parse_args()
+    handlers = {"status": cmd_status, "on": cmd_on, "off": cmd_off, "select": cmd_select, "use": cmd_use,
+                "update": cmd_update, "sub": cmd_sub, "build": cmd_build, "net": cmd_net, "fw": cmd_fw,
+                "dns": cmd_dns, "trim": cmd_trim, "preset": cmd_preset, "fallback": cmd_fallback,
+                "rule": cmd_rule, "notify": cmd_notify, "watch": cmd_watch, "core": cmd_core}
+    if not args.cmd:
+        args = p.parse_args(["status"])
+    if args.cmd == "core" and args.action == "install" and not args.target:
+        p.error("core install needs a version")
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,16 @@
+# Python bytecode from running the backend scripts or tests
+__pycache__/
+*.pyc
+# Logs and editor/OS litter
+*.log
+.DS_Store
+*.swp
+*~
+node_modules/
+# makepkg output, if the package is ever built in place by mistake
+backend/src/
+backend/pkg/
+backend/*.pkg.tar.*
+src/
+pkg/
+*.pkg.tar.*

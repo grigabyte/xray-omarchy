@@ -1,0 +1,34 @@
+[Unit]
+Description=xray-omarchy: tunnel on the xray core (TUN xray-omarchy0, DNS 127.0.0.1:53)
+Documentation=https://github.com/grigabyte/xray-omarchy
+After=network.target
+# Restart=always without a limit: a start whose `net up` could not set the
+# routes fails (the core is stopped, the killswitch stays) and is tried again,
+# every 2 s at first and at most every 30 s, until it works or `off`.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=XRAY_LOCATION_ASSET=%h/.local/share/xray-omarchy
+# A failed build does not stop the start: the previous working config stays.
+ExecStartPre=/usr/bin/xray-omarchy build
+# The killswitch goes up before the core: nothing leaves while the TUN comes up.
+# It exits non-zero when the table is not loaded, and then the core does not start.
+ExecStartPre=/usr/bin/xray-omarchy fw on
+# The core is the official XTLS release with a SHA-256 the package pins, put in
+# root's directory by the helper (`xray-omarchy core update`); current/ links
+# to the active version.
+ExecStart=/var/lib/xray-omarchy/core/current/xray run -c %h/.local/state/xray-omarchy/config.json
+ExecStartPost=/usr/bin/xray-omarchy net up
+ExecStopPost=/usr/bin/xray-omarchy net down
+Restart=always
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=30
+LimitNOFILE=65536
+# The connection log lives only in tmpfs and disappears when the core stops.
+RuntimeDirectory=xray-omarchy
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=default.target
